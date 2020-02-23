@@ -23,8 +23,8 @@ enum StereoMode {
 
 class Camera : public virtual Object {
 public:
-	ENGINE_EXPORT Camera(const std::string& name, Window* targetWindow, VkFormat depthFormat = VK_FORMAT_D32_SFLOAT, VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_8_BIT, bool renderDepthNormals = true);
-	ENGINE_EXPORT Camera(const std::string& name, ::Device* device, VkFormat renderFormat = VK_FORMAT_R8G8B8A8_UNORM, VkFormat depthFormat = VK_FORMAT_D32_SFLOAT, VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_8_BIT, bool renderDepthNormals = true);
+	ENGINE_EXPORT Camera(const std::string& name, Window* targetWindow, VkFormat depthFormat = VK_FORMAT_D32_SFLOAT, VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_4_BIT);
+	ENGINE_EXPORT Camera(const std::string& name, ::Device* device, VkFormat renderFormat = VK_FORMAT_R8G8B8A8_UNORM, VkFormat depthFormat = VK_FORMAT_D32_SFLOAT, VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_4_BIT);
 	ENGINE_EXPORT Camera(const std::string& name, ::Framebuffer* framebuffer);
 	ENGINE_EXPORT virtual ~Camera();
 
@@ -75,7 +75,7 @@ public:
 	inline virtual void FramebufferHeight(uint32_t h) { mFramebuffer->Height(h); mMatricesDirty = true; }
 	inline virtual void SampleCount(VkSampleCountFlagBits s) { mFramebuffer->SampleCount(s); }
 
-	inline virtual void EyeTransform(const float4x4& transform, StereoEye eye = EYE_NONE) { mEyeTransform[eye] = transform; mMatricesDirty = true; }
+	inline virtual void HeadToEye(const float4x4& transform, StereoEye eye = EYE_NONE) { mHeadToEye[eye] = transform; mMatricesDirty = true; }
 	inline virtual void Projection(const float4x4& projection, StereoEye eye = EYE_NONE) { mFieldOfView = 0; mOrthographic = false; mProjection[eye] = projection; mMatricesDirty = true; }
 
 
@@ -117,7 +117,7 @@ public:
 	inline virtual float4x4 ViewProjection(StereoEye eye = EYE_NONE) { UpdateMatrices(); return mViewProjection[eye]; }
 	inline virtual float4x4 InverseViewProjection(StereoEye eye = EYE_NONE) { UpdateMatrices(); return mInvViewProjection[eye]; }
 
-	inline virtual float4x4 EyeTransform(StereoEye eye = EYE_NONE) { return mEyeTransform[eye]; }
+	inline virtual float4x4 HeadToEye(StereoEye eye = EYE_NONE) { return mHeadToEye[eye]; }
 
 	inline virtual const float4* Frustum() { UpdateMatrices(); return mFrustum; }
 
@@ -125,8 +125,6 @@ private:
 	uint32_t mRenderPriority;
 
 	::StereoMode mStereoMode;
-
-	bool mRenderDepthNormals;
 
 	bool mOrthographic;
 	float mOrthographicSize;
@@ -141,7 +139,7 @@ private:
 	float4x4 mInvProjection[2];
 	float4x4 mInvView[2];
 	float4x4 mInvViewProjection[2];
-	float4x4 mEyeTransform[2];
+	float4x4 mHeadToEye[2];
 	bool mMatricesDirty;
 
 	float4 mFrustum[6];

@@ -10,7 +10,7 @@ void ObjectBvh2::Build(Object** objects, uint32_t objectCount) {
 
 	for (uint32_t i = 0; i < objectCount; i++) {
 		AABB aabb(objects[i]->Bounds());
-		aabb.mMin += 1e-3f;
+		aabb.mMin -= 1e-3f;
 		aabb.mMax += 1e-3f;
 		mPrimitives.push_back({ aabb, objects[i] });
 	}
@@ -198,12 +198,4 @@ Object* ObjectBvh2::Intersect(const Ray& ray, float* t, bool any, uint32_t mask)
 	return hitObject;
 }
 
-void ObjectBvh2::DrawGizmos(CommandBuffer* commandBuffer, Camera* camera, Scene* scene) {
-	for (uint32_t ni = 0; ni < mNodes.size(); ni++) {
-		const Node& node = mNodes[ni];
-		if (node.mRightOffset == 0) {
-			AABB box = mPrimitives[node.mStartIndex].mBounds;
-			Gizmos::DrawWireCube(box.Center(), box.Extents(), quaternion(), float4(1, 1, 1, .4f));
-		}
-	}
-}
+void ObjectBvh2::DrawGizmos(CommandBuffer* commandBuffer, Camera* camera, Scene* scene) {}

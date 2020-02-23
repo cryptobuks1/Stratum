@@ -106,6 +106,14 @@ uint32_t GetDepth(aiNode* node) {
 	}
 	return d;
 }
+float4x4 ConvertMatrix(const aiMatrix4x4& m) {
+	return float4x4(
+		m.a1, m.b1, m.c1, m.d1,
+		m.a2, m.b2, m.c2, m.d2,
+		m.a3, m.b3, m.c3, m.d3,
+		m.a4, m.b4, m.c4, m.d4
+	);
+}
 
 Bone* AddBone(AnimationRig& rig, aiNode* node, const aiScene* scene, aiNode* root, unordered_map<aiNode*, Bone*>& boneMap, float scale) {
 	if (node == root) return nullptr;
@@ -264,8 +272,9 @@ Mesh::Mesh(const string& name, ::Device* device, const string& filename, float s
 			Bone* bone = AddBone(rig, node, scene, root, boneMap, scale);
 			if (!bone) continue;
 			BoneTransform bt;
-			bt.FromMatrix(ConvertMatrix(b.second->mOffsetMatrix), scale);
-			bone->mInverseBind = inverse(bt.ToMatrix());
+			ConvertMatrix(b.second->mOffsetMatrix).Decompose(&bt.mPosition, &bt.mRotation, &bt.mScale);
+			bt.mPosition *= scale;
+			bone->mInverseBind = inverse(float4x4::TRS(bt.mPosition, bt.mRotation, bt.mScale));
 			bonesByName.emplace(b.second->mName.C_Str(), bone->mBoneIndex);
 		}
 
@@ -275,7 +284,8 @@ Mesh::Mesh(const string& name, ::Device* device, const string& filename, float s
 			root = root->mParent;
 		}
 		BoneTransform roott;
-		roott.FromMatrix(rootTransform, scale);
+		rootTransform.Decompose(&roott.mPosition, &roott.mRotation, &roott.mScale);
+		roott.mPosition *= scale;
 
 		for (auto& b : rig) {
 			if (!b->Parent()) {
@@ -293,7 +303,8 @@ Mesh::Mesh(const string& name, ::Device* device, const string& filename, float s
 
 		for (uint32_t i = 0; i < scene->mNumAnimations; i++) {
 			const aiAnimation* anim = scene->mAnimations[i];
-			mAnimations.emplace(anim->mName.C_Str(), new Animation(anim, bonesByName, scale));
+			throw;
+			//mAnimations.emplace(anim->mName.C_Str(), new Animation(anim, bonesByName, scale));
 		}
 
 		vector<VertexWeight> vertexWeights(vertices.size());
@@ -406,30 +417,57 @@ Mesh* Mesh::CreatePlane(const string& name, Device* device, float s) {
 		{ float3( s,  s, 0), float3(0,0,1), float4(1,0,0,1), float2(1,1) }
 	};
 	const uint16_t indices[6]{
-		0,2,1,2,3,1,
+		0,2,1,2,3,1
 	};
 	return new Mesh(name, device, verts, indices, 8, sizeof(StdVertex), 6, &StdVertex::VertexInput, VK_INDEX_TYPE_UINT16);
 }
 Mesh* Mesh::CreateCube(const string& name, Device* device, float r) {
-	float3 verts[8]{
-		float3(-r, -r, -r),
-		float3( r, -r, -r),
-		float3(-r, -r,  r),
-		float3( r, -r,  r),
-		float3(-r,  r, -r),
-		float3( r,  r, -r),
-		float3(-r,  r,  r),
-		float3( r,  r,  r),
+	StdVertex verts[24]{
+		// front
+		{ float3(-r, -r,  r), float3(0,0,1), float4(1,0,0,1), float2(0,0) },
+		{ float3( r, -r,  r), float3(0,0,1), float4(1,0,0,1), float2(1,0) },
+		{ float3(-r,  r,  r), float3(0,0,1), float4(1,0,0,1), float2(0,1) },
+		{ float3( r,  r,  r), float3(0,0,1), float4(1,0,0,1), float2(1,1) },
+		
+		// back
+		{ float3(-r, -r, -r), float3(0,0,-1), float4(1,0,0,1), float2(0,0) },
+		{ float3(-r,  r, -r), float3(0,0,-1), float4(1,0,0,1), float2(0,1) },
+		{ float3( r, -r, -r), float3(0,0,-1), float4(1,0,0,1), float2(1,0) },
+		{ float3( r,  r, -r), float3(0,0,-1), float4(1,0,0,1), float2(1,1) },
+
+		// right
+		{ float3(r, -r, -r), float3(1,0,0), float4(0,0,1,1), float2(0,0) },
+		{ float3(r,  r, -r), float3(1,0,0), float4(0,0,1,1), float2(1,0) },
+		{ float3(r, -r,  r), float3(1,0,0), float4(0,0,1,1), float2(0,1) },
+		{ float3(r,  r,  r), float3(1,0,0), float4(0,0,1,1), float2(1,1) },
+
+		// left
+		{ float3(-r, -r, -r), float3(-1,0,0), float4(0,0,-1,1), float2(0,0) },
+		{ float3(-r, -r,  r), float3(-1,0,0), float4(0,0,-1,1), float2(0,1) },
+		{ float3(-r,  r, -r), float3(-1,0,0), float4(0,0,-1,1), float2(1,0) },
+		{ float3(-r,  r,  r), float3(-1,0,0), float4(0,0,-1,1), float2(1,1) },
+
+		// top
+		{ float3(-r, r, -r), float3(0,1,0), float4(1,0,0,1), float2(0,0) },
+		{ float3(-r, r,  r), float3(0,1,0), float4(1,0,0,1), float2(0,1) },
+		{ float3( r, r, -r), float3(0,1,0), float4(1,0,0,1), float2(1,0) },
+		{ float3( r, r,  r), float3(0,1,0), float4(1,0,0,1), float2(1,1) },
+
+		// bottom
+		{ float3(-r, -r, -r), float3(0,-1,0), float4(1,0,0,1), float2(0,0) },
+		{ float3( r, -r, -r), float3(0,-1,0), float4(1,0,0,1), float2(1,0) },
+		{ float3(-r, -r,  r), float3(0,-1,0), float4(1,0,0,1), float2(0,1) },
+		{ float3( r, -r,  r), float3(0,-1,0), float4(1,0,0,1), float2(1,1) }
 	};
 	uint16_t indices[36]{
-		2,7,6,2,3,7,
-		0,1,2,2,1,3,
-		1,5,7,7,3,1,
-		4,5,1,4,1,0,
-		6,4,2,4,0,2,
-		4,7,5,4,6,7
+		0,2,1,2,3,1,
+		4,6,5,6,7,5,
+		8,10,9,10,11,9,
+		12,14,13,14,15,13,
+		16,18,17,18,19,17,
+		20,22,21,22,23,21,
 	};
-	return new Mesh(name, device, verts, indices, 8, sizeof(float3), 36, &Float3VertexInput, VK_INDEX_TYPE_UINT16);
+	return new Mesh(name, device, verts, indices, 24, sizeof(StdVertex), 36, &StdVertex::VertexInput, VK_INDEX_TYPE_UINT16);
 }
 
 bool Mesh::Intersect(const Ray& ray, float* t, bool any) {

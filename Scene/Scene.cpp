@@ -1,6 +1,7 @@
 #include <Scene/Scene.hpp>
 #include <Scene/Renderer.hpp>
 #include <Scene/MeshRenderer.hpp>
+#include <Scene/GUI.hpp>
 #include <Core/Instance.hpp>
 #include <Util/Profiler.hpp>
 
@@ -35,7 +36,7 @@ bool RendererCompare(Object* oa, Object* ob) {
 };
 
 Scene::Scene(::Instance* instance, ::AssetManager* assetManager, ::InputManager* inputManager, ::PluginManager* pluginManager)
-	: mInstance(instance), mAssetManager(assetManager), mInputManager(inputManager), mPluginManager(pluginManager), mDrawGizmos(false), mBvhDirty(true) {
+	: mInstance(instance), mAssetManager(assetManager), mInputManager(inputManager), mPluginManager(pluginManager), mLastBvhBuild(0), mDrawGizmos(false), mBvhDirty(true) {
 	mBvh = new ObjectBvh2();
 	mShadowTexelSize = float2(1.f / SHADOW_ATLAS_RESOLUTION, 1.f / SHADOW_ATLAS_RESOLUTION) * .75f;
 	mEnvironment = new ::Environment(this);
@@ -623,6 +624,7 @@ void Scene::PreFrame(CommandBuffer* commandBuffer) {
 	PROFILER_END;
 
 	Gizmos::PreFrame(this);
+	GUI::PreFrame(this);
 
 	PROFILER_END;
 }
@@ -700,7 +702,7 @@ void Scene::Render(CommandBuffer* commandBuffer, Camera* camera, Framebuffer* fr
 		PROFILER_END;
 	}
 
-	#pragma region Render batched
+	#pragma region Render renderers
 	uint32_t frameContextIndex = commandBuffer->Device()->FrameContextIndex();
 	DescriptorSet* batchDS = nullptr;
 	Buffer* batchBuffer = nullptr;
@@ -814,12 +816,18 @@ void Scene::Render(CommandBuffer* commandBuffer, Camera* camera, Framebuffer* fr
 		PROFILER_END;
 	}
 
-	camera->Set(commandBuffer);
+	if (pass == PASS_MAIN) {
+		PROFILER_BEGIN("Draw GUI");
+		GUI::Draw(commandBuffer, pass, camera);
+		PROFILER_END;
+	}
 
+	camera->Set(commandBuffer);
 	PROFILER_BEGIN("Plugin PostRenderScene");
 	for (const auto& p : mPluginManager->Plugins())
 		if (p->mEnabled) p->PostRenderScene(commandBuffer, camera, pass);
 	PROFILER_END;
+
 
 	PROFILER_BEGIN("End RenderPass");
 	vkCmdEndRenderPass(*commandBuffer);
@@ -838,6 +846,7 @@ ObjectBvh2* Scene::BVH() {
 		mBvh->Build(objs, mObjects.size());
 		delete[] objs;
 		mBvhDirty = false;
+		mLastBvhBuild = mInstance->FrameCount();
 		PROFILER_END;
 	}
 	return mBvh;

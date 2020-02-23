@@ -2058,24 +2058,28 @@ struct quaternion {
 		xyz = axis * sinf(angle);
 		w = cosf(angle);
 	};
-	inline quaternion(const float3& v1, const float3& v2){
+	inline quaternion() : quaternion(0, 0, 0, 1) {};
+
+	inline static quaternion FromTo(const float3& v1, const float3& v2){
 		float d = dot(v1, v2);
 		if (d < -0.999999f) {
 			float3 tmp = cross(float3(1, 0, 0), v1);
 			if (dot(tmp, tmp) < 1e-5f) tmp = cross(float3(0, 1, 0), v1);
-			xyz = normalize(tmp) * sinf(PI / 2);
-			w = cosf(PI / 2);
+			quaternion r;
+			r.xyz = normalize(tmp) * sinf(PI / 2);
+			r.w = cosf(PI / 2);
+			return r;
 		} else if (d > 0.999999f) {
-			xyz = 0;
-			w = 1;
+			return quaternion(0,0,0,1);
 		} else {
-			xyz = cross(v1, v2);
-			w = 1 + d;
-			xyzw /= length(xyzw);
+			quaternion r;
+			r.xyz = cross(v1, v2);
+			r.w = 1 + d;
+			r.xyzw /= length(r.xyzw);
+			return r;
 		}
 	}
 
-	inline quaternion() : quaternion(0, 0, 0, 1) {};
 
 	inline float3 forward() const {
 		return 2 * z * xyz + float3(0, 0, w * w - dot(xyz, xyz)) + 2 * w * float3(y, -x, 0);
@@ -2183,6 +2187,22 @@ struct float4x4 {
 		v[2][2] = 1 - 2 * (q2.x + q2.y);
 	}
 
+	inline void Decompose(float3* position, quaternion* rotation, float3* scale) {
+		if (position) *position = v[3].xyz;
+		if (scale) {
+			scale->x = length(v[0].xyz);
+			scale->y = length(v[1].xyz);
+			scale->z = length(v[2].xyz);
+		}
+		if (rotation) {
+			rotation->x = v[2].y - v[1].z;
+			rotation->y = v[0].z - v[2].x;
+			rotation->z = v[1].x - v[0].y;
+			rotation->w = sqrtf(1.f + v[0].x + v[1].y + v[2].z) * .5f;
+			rotation->xyz /= 4.f * rotation->w;
+		}
+	}
+
 	inline static float4x4 Look(const float3& p, const float3& fwd, const float3& up) {
 		float3 f[3];
 		f[0] = normalize(cross(up, fwd));
@@ -2226,13 +2246,42 @@ struct float4x4 {
 		return r;
 	}
 
-	inline static float4x4 Translate(const float3& p) {
-		float4x4 r(1);
-		r.v[3].xyz = p;
-		return r;
+	inline static float4x4 Translate(const float3& t) {
+		float4x4 m(1);
+		m.v[3].xyz = t;
+		return m;
 	}
-	inline static float4x4 Scale(const float3& p) {
-		return float4x4(float4(p[0], 0, 0, 0), float4(0, p[1], 0, 0), float4(0, 0, p[2], 0), float4(0, 0, 0, 1));
+	inline static float4x4 Scale(const float3& t) {
+		float4x4 m(1);
+		rpt3(i) m.v[i] *= t.v[i];
+		return m;
+	}
+	inline static float4x4 RotateX(float r) {
+		float c = cosf(r);
+		float s = sinf(r);
+		return float4x4(
+			1, 0, 0, 0,
+			0, c, -s, 0,
+			0, s, c, 0,
+			0, 0, 0, 1 );
+	}
+	inline static float4x4 RotateY(float r) {
+		float c = cosf(r);
+		float s = sinf(r);
+		return float4x4(
+			c, 0, s, 0,
+			0, 0, 0, 0,
+			-s, 0, c, 0,
+			0, 0, 0, 1 );
+	}
+	inline static float4x4 RotateZ(float r) {
+		float c = cosf(r);
+		float s = sinf(r);
+		return float4x4(
+			c, -s, 0, 0,
+			s, c, 0, 0,
+			0, 0, 0, 0,
+			0, 0, 0, 1 );
 	}
 
 	inline static float4x4 TRS(const float3& t, const quaternion& r, const float3& s) {

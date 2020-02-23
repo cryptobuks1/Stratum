@@ -5,221 +5,132 @@
 
 using namespace std;
 
-BoneTransform BoneTransform::operator*(const BoneTransform& rhs) const {
-	BoneTransform t = {};
-	t.mPosition = mPosition + (mRotation * rhs.mPosition) * mScale;
-	t.mRotation = mRotation * rhs.mRotation;
-	t.mScale = rhs.mScale * mScale;
-	return t;
-}
-float4x4 BoneTransform::ToMatrix() const {
-	return float4x4::TRS(mPosition, mRotation, mScale);
-}
+AnimationChannel::AnimationChannel(const vector<AnimationKeyframe>& keyframes, AnimationExtrapolate in, AnimationExtrapolate out)
+	: mKeyframes(keyframes), mExtrapolateIn(in), mExtrapolateOut(out) {
+	
+	if (!mKeyframes.size()) return;
 
-BoneTransform BoneTransform::Inverse() const {
-    quaternion ir = inverse(mRotation);
-	BoneTransform t = {};
-    t.mPosition = (ir * -mPosition) / mScale;
-	t.mRotation = ir;
-	t.mScale = 1.f / mScale;
-	return t;
-}
-
-void BoneTransform::FromMatrix(const float4x4& mat, float scale) {
-	mPosition = mat[3].xyz * scale;
-	mScale.x = length(mat[0].xyz);
-	mScale.y = length(mat[1].xyz);
-	mScale.z = length(mat[2].xyz);
-	mRotation.x = mat[2].y - mat[1].z;
-	mRotation.y = mat[0].z - mat[2].x;
-	mRotation.z = mat[1].x - mat[0].y;
-	mRotation.w = sqrtf(1.f + mat[0].x + mat[1].y + mat[2].z) * .5f;
-	mRotation.xyz /= 4.f * mRotation.w;
-}
-
-Animation::Animation(const aiAnimation* anim, const unordered_map<string, uint32_t>& bonesByName, float scale)
-	: mLength((float)(anim->mDuration / anim->mTicksPerSecond)) {
-
-	for (unsigned int c = 0; c < anim->mNumChannels; c++) {
-		const aiNodeAnim* channel = anim->mChannels[c];
-		if (bonesByName.count(channel->mNodeName.C_Str()) == 0) continue;
-
-		AnimationChannel& a = mChannels[bonesByName.at(channel->mNodeName.C_Str())];
-
-		for (unsigned int i = 0; i < channel->mNumPositionKeys; i++)
-			a.mTranslationKeys.push_back(TranslationKey{ {
-				(float)channel->mPositionKeys[i].mValue.x * scale,
-				(float)channel->mPositionKeys[i].mValue.y * scale,
-				(float)channel->mPositionKeys[i].mValue.z * scale,
-			},
-			(float)(channel->mPositionKeys[i].mTime / anim->mTicksPerSecond) });
-
-		for (unsigned int i = 0; i < channel->mNumRotationKeys; i++)
-			a.mRotationKeys.push_back(RotationKey{ {
-				(float)channel->mRotationKeys[i].mValue.x,
-				(float)channel->mRotationKeys[i].mValue.y,
-				(float)channel->mRotationKeys[i].mValue.z,
-				(float)channel->mRotationKeys[i].mValue.w,
-			},
-			(float)(channel->mRotationKeys[i].mTime / anim->mTicksPerSecond) });
-
-		for (unsigned int i = 0; i < channel->mNumScalingKeys; i++)
-			a.mScaleKeys.push_back(ScaleKey{ {
-				(float)channel->mScalingKeys[i].mValue.x,
-				(float)channel->mScalingKeys[i].mValue.y,
-				(float)channel->mScalingKeys[i].mValue.z,
-			},
-			(float)(channel->mScalingKeys[i].mTime / anim->mTicksPerSecond) });
-	}
-}
-
-void Animation::AnimationChannel::EvaluateTranslation(float t, float length, float3& out) const {
-	if (mTranslationKeys.size() == 0) return;
-
-	if (mTranslationKeys.size() == 1)
-		out = mTranslationKeys[0].position;
-	else {
-		const TranslationKey* k0 = &mTranslationKeys[mTranslationKeys.size() - 1];
-		const TranslationKey* k1 = &mTranslationKeys[0];
-
-		for (uint32_t j = 1; j < (uint32_t)mTranslationKeys.size(); j++) {
-			if (mTranslationKeys[j].time > t) {
-				k0 = &mTranslationKeys[j - 1];
-				k1 = &mTranslationKeys[j];
+	// compute tangents
+	for (uint32_t i = 0; i < mKeyframes.size(); i++) {
+		switch (mKeyframes[i].mTangentModeIn) {
+		case ANIMATION_TANGENT_SMOOTH:
+			if (i > 0 && i < mKeyframes.size()-1) {
+				mKeyframes[i].mTangentIn = (mKeyframes[i + 1].mValue - mKeyframes[i - 1].mValue) / (mKeyframes[i + 1].mTime - mKeyframes[i - 1].mTime);
 				break;
 			}
+		case ANIMATION_TANGENT_LINEAR:
+			if (i > 0) mKeyframes[i].mTangentIn = (mKeyframes[i].mValue - mKeyframes[i-1].mValue) / (mKeyframes[i].mTime - mKeyframes[i - 1].mTime);
+			break;
 		}
 
-		float kt = 0.f;
-		float tt = k1->time - k0->time;
-		if (tt < 0.0) {
-			tt = length - k0->time + k1->time;
-			if (t < k0->time) {
-				kt = clamp((t + length - k0->time) / tt, 0.f, 1.f);
-			} else {
-				kt = clamp((t - k0->time) / tt, 0.f, 1.f);
-			}
-		} else
-			kt = clamp((t - k0->time) / tt, 0.f, 1.f);
-		out = lerp(k0->position, k1->position, kt);
-	}
-}
-void Animation::AnimationChannel::EvaluateRotation(float t, float length, quaternion& out) const {
-	if (mRotationKeys.size() == 0) return;
-
-	if (mRotationKeys.size() == 1)
-		out = mRotationKeys[0].rotation;
-	else {
-		const RotationKey* k0 = &mRotationKeys[mRotationKeys.size() - 1];
-		const RotationKey* k1 = &mRotationKeys[0];
-
-		for (uint32_t j = 1; j < (uint32_t)mRotationKeys.size(); j++) {
-			if (mRotationKeys[j].time > t) {
-				k0 = &mRotationKeys[j - 1];
-				k1 = &mRotationKeys[j];
+		switch (mKeyframes[i].mTangentModeOut) {
+		case ANIMATION_TANGENT_SMOOTH:
+			if (i > 0 && i < mKeyframes.size() - 1) {
+				mKeyframes[i].mTangentOut = (mKeyframes[i + 1].mValue - mKeyframes[i - 1].mValue) / (mKeyframes[i + 1].mTime - mKeyframes[i - 1].mTime);
 				break;
 			}
+		case ANIMATION_TANGENT_LINEAR:
+			if (i < mKeyframes.size() - 1) mKeyframes[i].mTangentOut = (mKeyframes[i + 1].mValue - mKeyframes[i].mValue) / (mKeyframes[i + 1].mTime - mKeyframes[i].mTime);
+			break;
+		}
+	}
+
+	mKeyframes[0].mTangentIn = mKeyframes[0].mTangentOut;
+	mKeyframes[mKeyframes.size() - 1].mTangentOut = mKeyframes[mKeyframes.size() - 1].mTangentIn;
+	
+	// compute curve
+	mCoefficients.resize(mKeyframes.size());
+	memset(mCoefficients.data(), 0, sizeof(float4) * mCoefficients.size());
+	for (uint32_t i = 0; i < mKeyframes.size() - 1; i++) {
+
+		float ts =  mKeyframes[i + 1].mTime - mKeyframes[i].mTime;
+
+		float p0y = mKeyframes[i].mValue;
+		float p1y = mKeyframes[i + 1].mValue;
+		float v0 = mKeyframes[i].mTangentOut * ts;
+		float v1 = mKeyframes[i + 1].mTangentIn * ts;
+
+		mCoefficients[i].x = p0y;
+		if (mKeyframes[i].mTangentModeOut == ANIMATION_TANGENT_STEP) continue;
+
+		mCoefficients[i].y = v0;
+		mCoefficients[i].z = 3 * (p1y - p0y) - 2*v0 - v1;
+		mCoefficients[i].w = p1y - p0y - v0 - mCoefficients[i].z;
+	}
+}
+
+float AnimationChannel::Sample(float t) const {
+	if (mKeyframes.size() == 0) return 0;
+	if (mKeyframes.size() == 1) return mKeyframes[0].mValue;
+
+	const AnimationKeyframe& first = mKeyframes[0];
+	const AnimationKeyframe& last = mKeyframes[mKeyframes.size() - 1];
+
+	float length = last.mTime - first.mTime;
+	float ts = first.mTime - t;
+	float tl = t - last.mTime;
+	float offset = 0;
+	
+	if (tl > 0) {
+		switch (mExtrapolateOut) {
+		case EXTRAPOLATE_CONSTANT:
+			return last.mValue;
+		case EXTRAPOLATE_LINEAR:
+			return last.mValue + last.mTangentOut * tl;
+		case EXTRAPOLATE_CYCLE_OFFSET:
+			offset += (last.mValue - first.mValue) * (floorf(tl / length) + 1);
+		case EXTRAPOLATE_CYCLE:
+			t = fmodf(tl, length);
+			break;
+		case EXTRAPOLATE_BOUNCE:
+			t = fmodf(tl, 2 * length);
+			if (t > length) t = 2 * length - t;
+			break;
+		}
+		t += first.mTime;
+	}
+	if (ts > 0) {
+		switch (mExtrapolateIn) {
+		case EXTRAPOLATE_CONSTANT:
+			return first.mValue;
+		case EXTRAPOLATE_LINEAR:
+			return first.mValue - first.mTangentIn * ts;
+		case EXTRAPOLATE_CYCLE_OFFSET:
+			offset += (first.mValue - last.mValue) * (floorf(ts / length) + 1);
+		case EXTRAPOLATE_CYCLE:
+			t = fmodf(ts, length);
+			break;
+		case EXTRAPOLATE_BOUNCE:
+			t = fmodf(ts, 2 * length);
+			if (t > length) t = 2 * length - t;
+			break;
+		}
+		t = last.mTime - t; // looping anims loop back to last key
+	}
+
+	// find the first key after t
+	uint32_t i = 0;
+	for (uint32_t j = 1; j < (uint32_t)mKeyframes.size(); j++)
+		if (mKeyframes[j].mTime > t) {
+			i = j - 1;
+			break;
 		}
 
-		float kt = 0.f;
-		float tt = k1->time - k0->time;
-		if (tt < 0.0) {
-			tt = length - k0->time + k1->time;
-			if (t < k0->time) {
-				kt = clamp((t + length - k0->time) / tt, 0.f, 1.f);
-			}else{
-				kt = clamp((t - k0->time) / tt, 0.f, 1.f);
-			}
-		} else
-			kt = clamp((t - k0->time) / tt, 0.f, 1.f);
-		out.xyzw = normalize(lerp(k0->rotation.xyzw, k1->rotation.xyzw, kt));
-	}
-}
-void Animation::AnimationChannel::EvaluateScale(float t, float length, float3& out) const {
-	if (mScaleKeys.size() == 0) return;
-
-	if (mScaleKeys.size() == 1 || t <= mScaleKeys[0].time)
-		out = mScaleKeys[0].scale;
-	else if (t >= mScaleKeys[mScaleKeys.size() - 1].time)
-		out = mScaleKeys[mScaleKeys.size() - 1].scale;
-	else {
-		const ScaleKey* k0 = &mScaleKeys[mScaleKeys.size() - 1];
-		const ScaleKey* k1 = &mScaleKeys[0];
-
-		for (uint32_t j = 1; j < (uint32_t)mScaleKeys.size(); j++) {
-			if (mScaleKeys[j].time > t) {
-				k0 = &mScaleKeys[j - 1];
-				k1 = &mScaleKeys[j];
-				break;
-			}
-		}
-
-		float kt = 0.f;
-		float tt = k1->time - k0->time;
-		if (tt < 0.0) {
-			tt = length - k0->time + k1->time;
-			if (t < k0->time) {
-				kt = clamp((t + length - k0->time) / tt, 0.f, 1.f);
-			} else {
-				kt = clamp((t - k0->time) / tt, 0.f, 1.f);
-			}
-		} else
-			kt = clamp((t - k0->time) / tt, 0.f, 1.f);
-		out = lerp(k0->scale, k1->scale, kt);
-	}
+	float u = (t - mKeyframes[i].mTime) / (mKeyframes[i + 1].mTime - mKeyframes[i].mTime);
+	float4 c = mCoefficients[i];
+	return u*u*u*c.w + u*u*c.z + u*c.y + c.x + offset;
 }
 
-void Animation::GetBone(AnimationRig& rig, unsigned int boneIndex, BoneTransform& bone) {
-	bone.FromMatrix(rig[boneIndex]->ObjectToParent(), 1.f);
-}
-void Animation::GetPose(AnimationRig& rig, Pose& dest) {
-	dest.resize(rig.size());
-	for (unsigned int i = 0; i < rig.size(); i++)
-		GetBone(rig, i, dest[i]);
-}
-void Animation::SetPose(AnimationRig& rig, Pose& pose) {
-	for (unsigned int i = 0; i < rig.size(); i++) {
-		rig[i]->LocalPosition(pose[i].mPosition);
-		rig[i]->LocalRotation(pose[i].mRotation);
-		rig[i]->LocalScale(pose[i].mScale);
+Animation::Animation(const unordered_map<uint32_t, AnimationChannel>& channels, float start, float end)
+	: mChannels(channels), mTimeStart(start), mTimeEnd(end) {}
 
-		if (Bone* parent = dynamic_cast<Bone*>(rig[i]->Parent()))
-			pose[i] = pose[parent->mBoneIndex] * pose[i];
-	}
-}
-
-void Animation::Evaluate(float time, AnimationRig& rig, uint32_t boneIndex, BoneTransform& bone) const {
-	bone.mPosition = rig[boneIndex]->LocalPosition();
-	bone.mRotation = rig[boneIndex]->LocalRotation();
-	bone.mScale = rig[boneIndex]->LocalScale();
-
-	if (mChannels.count(boneIndex)) {
-		auto& channel = mChannels.at(boneIndex);
-		channel.EvaluateTranslation(time, mLength, bone.mPosition);
-		channel.EvaluateRotation(time, mLength, bone.mRotation);
-		channel.EvaluateScale(time, mLength, bone.mScale);
-	}
-}
-void Animation::Evaluate(float time, AnimationRig& rig) const {
+void Animation::Sample(float t, AnimationRig& rig) const {
+	rig[0]->LocalPosition(mChannels.at(0).Sample(t), mChannels.at(1).Sample(t), -mChannels.at(2).Sample(t));
 	for (uint32_t i = 0; i < rig.size(); i++) {
-		if (mChannels.count(i)) {
-			auto& channel = mChannels.at(i);
-
-			float3 t = rig[i]->LocalPosition();
-			quaternion r = rig[i]->LocalRotation();
-			float3 s = rig[i]->LocalScale();
-
-			channel.EvaluateTranslation(time, mLength, t);
-			channel.EvaluateRotation(time, mLength, r);
-			channel.EvaluateScale(time, mLength, s);
-
-			rig[i]->LocalPosition(t);
-			rig[i]->LocalRotation(r);
-			rig[i]->LocalScale(s);
-		}
+		float3 euler(mChannels.at(3 * i + 3).Sample(t), mChannels.at(3 * i + 4).Sample(t), mChannels.at(3 * i + 5).Sample(t));
+		quaternion r(euler);
+		r.x = -r.x;
+		r.y = -r.y;
+		rig[i]->LocalRotation(r);
 	}
-}
-void Animation::Evaluate(float time, AnimationRig& rig, Pose& pose) const {
-	for (uint32_t i = 0; i < rig.size(); i++)
-		Evaluate(time, rig, i, pose[i]);
 }

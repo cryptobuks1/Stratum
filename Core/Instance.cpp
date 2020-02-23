@@ -3,8 +3,38 @@
 #include <Core/Window.hpp>
 #include <Scene/Camera.hpp>
 #include <Util/Profiler.hpp>
+#include <Core/PluginManager.hpp>
 
 using namespace std;
+
+// Debug messenger functions
+#ifdef ENABLE_DEBUG_LAYERS
+VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageType, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData) {
+	if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+		fprintf_color(COLOR_RED_BOLD, stderr, "%s: %s\n", pCallbackData->pMessageIdName, pCallbackData->pMessage);
+		throw;
+	} else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+		if (strcmp("UNASSIGNED-CoreValidation-Shader-OutputNotConsumed", pCallbackData->pMessageIdName) == 0) return VK_FALSE;
+		if (strcmp("UNASSIGNED-CoreValidation-DrawState-ClearCmdBeforeDraw", pCallbackData->pMessageIdName) == 0) return VK_FALSE;
+		fprintf_color(COLOR_YELLOW_BOLD, stderr, "%s: %s\n", pCallbackData->pMessageIdName, pCallbackData->pMessage);
+	} else
+		printf("%s: %s\n", pCallbackData->pMessageIdName, pCallbackData->pMessage);
+
+	return VK_FALSE;
+}
+VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDebugUtilsMessengerEXT* pDebugMessenger) {
+	auto func = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
+	if (func != nullptr)
+		return func(instance, pCreateInfo, pAllocator, pDebugMessenger);
+	else
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+void DestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT debugMessenger, const VkAllocationCallbacks* pAllocator) {
+	auto func = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
+	if (func != nullptr)
+		func(instance, debugMessenger, pAllocator);
+}
+#endif
 
 #ifdef WINDOWS
 std::vector<Instance*> Instance::sInstances;
@@ -30,31 +60,56 @@ LRESULT CALLBACK Instance::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
 }
 #endif
 
-Instance::Instance(const DisplayCreateInfo& display)
-	: mInstance(VK_NULL_HANDLE), mFrameCount(0), mMaxFramesInFlight(0), mTotalTime(0), mDeltaTime(0), mWindow(nullptr), mWindowInput(nullptr), mDestroyPending(false) {
+Instance::Instance(int argc, char** argv, PluginManager* pluginManager)
+	: mInstance(VK_NULL_HANDLE), mFrameCount(0), mMaxFramesInFlight(0), mTotalTime(0), mDeltaTime(0), mWindow(nullptr), mWindowInput(nullptr), mDestroyPending(false)
+	#ifdef ENABLE_DEBUG_LAYERS
+	, mDebugMessenger(VK_NULL_HANDLE)
+	#endif
+	{
+
+	for (int i = 0; i < argc; i++)
+		mCmdArguments.push_back(argv[i]);
+
+	bool debugMessenger = true;
+	uint32_t deviceIndex = 0;
+	VkRect2D windowPosition = { { 160, 90 }, { 1600, 900 } };
+	bool fullscreen = false;
+	for (int i = 0; i < argc; i++) {
+		if (mCmdArguments[i] == "--device") {
+			i++;
+			if (i < argc) deviceIndex = atoi(argv[i]);
+		} else if (mCmdArguments[i] == "--fullscreen")
+			fullscreen = true;
+		else if (mCmdArguments[i] == "--nodebug")
+			debugMessenger = false;
+	}
+
 
 	memset(const_cast<ProfilerSample*>(Profiler::Frames()), 0, sizeof(ProfilerSample)* PROFILER_FRAME_COUNT);
 
-	vector<const char*> deviceExtensions {
+	mInstanceExtensions  = { VK_KHR_SURFACE_EXTENSION_NAME };
+	mDeviceExtensions = {
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 		VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME
 	};
+
 	vector<const char*> validationLayers;
-	set<string> instanceExtensions { VK_KHR_SURFACE_EXTENSION_NAME };
 	#ifdef ENABLE_DEBUG_LAYERS
-	instanceExtensions.insert(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+	mInstanceExtensions.insert(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 	validationLayers.push_back("VK_LAYER_KHRONOS_validation");
 	validationLayers.push_back("VK_LAYER_LUNARG_core_validation");
 	validationLayers.push_back("VK_LAYER_LUNARG_standard_validation");
 	#endif
+	
 	#ifdef __linux
-	instanceExtensions.insert(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
-	instanceExtensions.insert(VK_KHR_DISPLAY_EXTENSION_NAME);
-	instanceExtensions.insert(VK_EXT_DIRECT_MODE_DISPLAY_EXTENSION_NAME);
-	instanceExtensions.insert(VK_EXT_ACQUIRE_XLIB_DISPLAY_EXTENSION_NAME);
+	mInstanceExtensions.insert(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
+	mInstanceExtensions.insert(VK_KHR_DISPLAY_EXTENSION_NAME);
 	#else
-	instanceExtensions.insert(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+	mInstanceExtensions.insert(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
 	#endif
+
+	for (EnginePlugin* p : pluginManager->Plugins())
+		p->PreInstanceInit(this);
 
 	#pragma region Create Vulkan Instance
 
@@ -87,7 +142,7 @@ Instance::Instance(const DisplayCreateInfo& display)
 	appInfo.apiVersion = VK_API_VERSION_1_1;
 
 	vector<const char*> exts;
-	for (const string& s : instanceExtensions)
+	for (const string& s : mInstanceExtensions)
 		exts.push_back(s.c_str());
 
 	VkInstanceCreateInfo createInfo = {};
@@ -102,6 +157,24 @@ Instance::Instance(const DisplayCreateInfo& display)
 	printf("Done.\n");
 
 	#pragma endregion
+
+	#ifdef ENABLE_DEBUG_LAYERS
+	if (debugMessenger) {
+		VkDebugUtilsMessengerCreateInfoEXT msgr = {};
+		msgr.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+		msgr.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+		msgr.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+		msgr.pfnUserCallback = DebugCallback;
+		printf("Creating debug messenger... ");
+		VkResult result = CreateDebugUtilsMessengerEXT(mInstance, &msgr, nullptr, &mDebugMessenger);
+		if (result == VK_SUCCESS)
+			fprintf_color(COLOR_GREEN, stdout, "Success.\n");
+		else {
+			fprintf_color(COLOR_RED, stderr, "Failed.\n");
+			mDebugMessenger = VK_NULL_HANDLE;
+		}
+	}
+	#endif
 
 	#ifdef WINDOWS
 	HINSTANCE hInstance = GetModuleHandleA(NULL);
@@ -141,7 +214,6 @@ Instance::Instance(const DisplayCreateInfo& display)
 	sInstances.push_back(this);
 	#endif
 
-
 	mWindowInput = new MouseKeyboardInput();
 
 	mMaxFramesInFlight = 0xFFFF;
@@ -153,13 +225,15 @@ Instance::Instance(const DisplayCreateInfo& display)
 	vector<VkPhysicalDevice> devices(deviceCount);
 	ThrowIfFailed(vkEnumeratePhysicalDevices(mInstance, &deviceCount, devices.data()), "vkEnumeratePhysicalDevices failed");
 
-
 	#pragma region Create Windows
-	if (display.mDeviceIndex >= devices.size()){
-		fprintf_color(COLOR_RED, stderr, "Device index out of bounds: %u\n", display.mDeviceIndex);
+	if (deviceIndex >= devices.size()){
+		fprintf_color(COLOR_RED, stderr, "Device index out of bounds: %u\n", deviceIndex);
 		throw;
 	}
-	VkPhysicalDevice physicalDevice = devices[display.mDeviceIndex];
+	VkPhysicalDevice physicalDevice = devices[deviceIndex];
+
+	for (EnginePlugin* p : pluginManager->Plugins())
+		p->PreDeviceInit(this, physicalDevice);
 
 	#ifdef __linux
 	// create xcb connection
@@ -183,7 +257,7 @@ Instance::Instance(const DisplayCreateInfo& display)
 
 		for (uint32_t q = 0; q < queueFamilyCount; q++){
 			if (vkGetPhysicalDeviceXcbPresentationSupportKHR(physicalDevice, q, mXCBConnection, screen->root_visual)){
-				mWindow = new ::Window(this, "Stratum", mWindowInput, display.mWindowPosition, mXCBConnection, screen);
+				mWindow = new ::Window(this, "Stratum", mWindowInput, windowPosition, mXCBConnection, screen);
 				break;
 			}
 		}
@@ -194,13 +268,14 @@ Instance::Instance(const DisplayCreateInfo& display)
 		throw;
 	}
 	#else
-	mWindow = new ::Window(this, "Stratum", mWindowInput, display.mWindowPosition, hInstance);
+	mWindow = new ::Window(this, "Stratum", mWindowInput, windowPosition, hInstance);
 	#endif
+	if (fullscreen) mWindow->Fullscreen(true);
 	#pragma endregion
 
 	uint32_t graphicsQueue, presentQueue;
 	Device::FindQueueFamilies(physicalDevice, mWindow->Surface(), graphicsQueue, presentQueue);
-	mDevice = new ::Device(this, physicalDevice, display.mDeviceIndex, graphicsQueue, presentQueue, deviceExtensions, validationLayers);
+	mDevice = new ::Device(this, physicalDevice, deviceIndex, graphicsQueue, presentQueue, mDeviceExtensions, validationLayers);
 
 	mWindow->CreateSwapchain(mDevice);
 	mMaxFramesInFlight = mWindow->mImageCount;
@@ -228,6 +303,10 @@ Instance::~Instance() {
 
 	safe_delete(mDevice);
 
+	#ifdef ENABLE_DEBUG_LAYERS
+	if (mDebugMessenger != VK_NULL_HANDLE) DestroyDebugUtilsMessengerEXT(mInstance, mDebugMessenger, nullptr);
+	#endif
+
 	vkDestroyInstance(mInstance, nullptr);
 }
 
@@ -244,7 +323,7 @@ void Instance::HandleMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
 			RECT cr;
 			GetClientRect(mWindow->mHwnd, &cr);
 			mWindow->mClientRect.offset = { (int32_t)cr.top, (int32_t)cr.left };
-			mWindow->mClientRect.extent = { (uint32_t)((int32_t)cr.bottom - (int32_t)cr.top), (uint32_t)((int32_t)cr.right - (int32_t)cr.left) };
+			mWindow->mClientRect.extent = { (uint32_t)((int32_t)cr.right - (int32_t)cr.left), (uint32_t)((int32_t)cr.bottom - (int32_t)cr.top) };
 		}
 		break;
 	}
@@ -365,6 +444,8 @@ bool Instance::PollEvents() {
 	
 
 	mWindowInput->mCurrent.mCursorDelta = mWindowInput->mCurrent.mCursorPos - mWindowInput->mLast.mCursorPos;
+	mWindowInput->mWindowWidth = mWindow->mClientRect.extent.width;
+	mWindowInput->mWindowHeight = mWindow->mClientRect.extent.height;
 	return !mDestroyPending;
 
 	#elif defined(WINDOWS)
@@ -463,6 +544,8 @@ bool Instance::PollEvents() {
 		float2 uv = mWindowInput->mCurrent.mCursorPos / float2((float)mWindow->mSwapchainSize.width, (float)mWindow->mSwapchainSize.height);
 		mWindowInput->mMousePointer.mWorldRay = mWindow->mTargetCamera->ScreenToWorldRay(uv);
 	}
+	mWindowInput->mWindowWidth = mWindow->mClientRect.extent.width;
+	mWindowInput->mWindowHeight = mWindow->mClientRect.extent.height;
 
 	return true;
 	#endif

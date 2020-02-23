@@ -208,8 +208,8 @@ uint32_t Font::GenerateGlyphs(const string& str, float scale, AABB* aabb, std::v
 
 	const FontGlyph* prev = nullptr;
 
-	float lineMin(0);
-	float lineMax(0);
+	float lineMin = 0;
+	float lineMax = 0;
 
 	uint32_t lineStart = 0;
 	uint32_t glyphCount = 0;
@@ -278,82 +278,24 @@ uint32_t Font::GenerateGlyphs(const string& str, float scale, AABB* aabb, std::v
 		verticalOffset = -p.y  * scale;
 		break;
 	case TEXT_ANCHOR_MID:
-		verticalOffset = (lc * (-mDescender - (mAscender - mDescender) * .5f)+ (lc - 1) * mLineSpace) * scale * .5f;
+		verticalOffset = (lc * (-mDescender - (mAscender - mDescender) * .5f) + (lc - 1) * mLineSpace) * scale * .5f;
 		break;
 	case TEXT_ANCHOR_MAX:
 		verticalOffset = 0;
 		break;
 	}
 
+	for (uint32_t i = 0; i < glyphCount; i++)
+		glyphs[i].mPosition.y += verticalOffset;
+
 	if (aabb) {
-		float2 mn(0);
-		float2 mx(0);
-		for (uint32_t i = 0; i < glyphCount; i++) {
-			glyphs[i].mPosition.y += verticalOffset;
-			if (i == 0) mn = mx = glyphs[i].mPosition;
+		float2 mn = glyphs[0].mPosition;
+		float2 mx = glyphs[0].mPosition + glyphs[0].mSize;
+		for (uint32_t i = 1; i < glyphCount; i++) {
 			mn = min(mn, glyphs[i].mPosition);
 			mx = max(mx, glyphs[i].mPosition + glyphs[i].mSize);
 		}
 		*aabb = AABB(float3(mn, 0), float3(mx, 0));
 	}
 	return glyphCount;
-}
-
-void Font::DrawScreenString(CommandBuffer* commandBuffer, Camera* camera, const string& str, const float4& color, const float2& screenPos, float scale, TextAnchor horizontalAnchor, TextAnchor verticalAnchor) {
-	GraphicsShader* shader = camera->Scene()->AssetManager()->LoadShader("Shaders/font.stm")->GetGraphics(PASS_MAIN, { "SCREEN_SPACE" });
-	if (!shader) return;
-
-	VkPipelineLayout layout = commandBuffer->BindShader(shader, PASS_MAIN, nullptr);
-	if (!layout) return;
-
-	vector<TextGlyph> glyphs(str.length());
-	uint32_t glyphCount = GenerateGlyphs(str, scale, nullptr, glyphs, horizontalAnchor, verticalAnchor);
-
-	if (glyphCount == 0) return;
-
-	Buffer* glyphBuffer = commandBuffer->Device()->GetTempBuffer("Glyph Buffer", glyphCount * sizeof(TextGlyph), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-	glyphBuffer->Upload(glyphs.data(), glyphCount * sizeof(TextGlyph));
-
-	DescriptorSet* descriptorSet = commandBuffer->Device()->GetTempDescriptorSet(mName + " DescriptorSet", shader->mDescriptorSetLayouts[PER_OBJECT]);
-	descriptorSet->CreateSampledTextureDescriptor(mTexture, BINDING_START + 0);
-	descriptorSet->CreateStorageBufferDescriptor(glyphBuffer, 0, glyphBuffer->Size(), BINDING_START + 2);
-	descriptorSet->FlushWrites();
-
-	float4 bounds(0,0,(float)camera->FramebufferWidth(), (float)camera->FramebufferHeight());
-
-	vkCmdBindDescriptorSets(*commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, PER_OBJECT, 1, *descriptorSet, 0, nullptr);
-	commandBuffer->PushConstant(shader, "Color", &color);
-	commandBuffer->PushConstant(shader, "Offset", &screenPos);
-	commandBuffer->PushConstant(shader, "ScreenSize", &bounds.z);
-	commandBuffer->PushConstant(shader, "Bounds", &bounds);
-	vkCmdDraw(*commandBuffer, glyphCount * 6, 1, 0, 0);
-}
-void Font::DrawWorldString(CommandBuffer* commandBuffer, Camera* camera, const string& str, const float4& color, const float4x4& objectToWorld, const float2& offset, float scale, TextAnchor horizontalAnchor, TextAnchor verticalAnchor) {
-	GraphicsShader* shader = camera->Scene()->AssetManager()->LoadShader("Shaders/font.stm")->GetGraphics(PASS_MAIN, {});
-	if (!shader) return;
-
-	VkPipelineLayout layout = commandBuffer->BindShader(shader, PASS_MAIN, nullptr, camera);
-	if (!layout) return;
-
-	vector<TextGlyph> glyphs(str.length());
-	uint32_t glyphCount = GenerateGlyphs(str, scale, nullptr, glyphs, horizontalAnchor, verticalAnchor);
-
-	if (glyphCount == 0) return;
-
-	Buffer* glyphBuffer = commandBuffer->Device()->GetTempBuffer("Glyph Buffer", glyphCount * sizeof(TextGlyph), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-	glyphBuffer->Upload(glyphs.data(), glyphCount * sizeof(TextGlyph));
-
-	DescriptorSet* descriptorSet = commandBuffer->Device()->GetTempDescriptorSet(mName + " DescriptorSet", shader->mDescriptorSetLayouts[PER_OBJECT]);
-	descriptorSet->CreateSampledTextureDescriptor(mTexture, BINDING_START + 0);
-	descriptorSet->CreateStorageBufferDescriptor(glyphBuffer, 0, glyphBuffer->Size(), BINDING_START + 2);
-	descriptorSet->FlushWrites();
-
-	float4 bounds(-1e20f, -1e20f, 1e20f, 1e20f);
-
-	vkCmdBindDescriptorSets(*commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, PER_OBJECT, 1, *descriptorSet, 0, nullptr);
-	commandBuffer->PushConstant(shader, "ObjectToWorld", &objectToWorld);
-	commandBuffer->PushConstant(shader, "Color", &color);
-	commandBuffer->PushConstant(shader, "Offset", &offset);
-	commandBuffer->PushConstant(shader, "Bounds", &bounds);
-	vkCmdDraw(*commandBuffer, glyphCount * 6, 1, 0, 0);
 }

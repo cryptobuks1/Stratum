@@ -1,10 +1,15 @@
 #include <Scene/MeshRenderer.hpp>
-#include <Scene/TextRenderer.hpp>
+#include <Content/Font.hpp>
+#include <Scene/GUI.hpp>
 #include <Util/Profiler.hpp>
-#include <Scene/Interface.hpp>
 
 #include <Core/EnginePlugin.hpp>
 #include <assimp/pbrmaterial.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <ThirdParty/stb_image.h>
+
+#include "Dicom.hpp"
 
 using namespace std;
 
@@ -14,15 +19,45 @@ private:
 	vector<Object*> mObjects;
 	Object* mSelected;
 
-	float3 mCameraEuler;
+	uint32_t mFrameIndex;
 
-	Object* mPlayer;
+	float3 mVolumePosition;
+	quaternion mVolumeRotation;
+	float3 mVolumeScale;
+
+	bool mPhysicalShading;
+	bool mColorize;
+	bool mInvert;
+	float mStepSize;
+	float mTransferMin;
+	float mTransferMax;
+	float mDensity;
+	float mRemapMin;
+	float mRemapMax;
+	float mCutoff;
+	float mVolumeScatter;
+	float mVolumeExtinction;
+	float mVolumePhaseHG;
+
+	Texture* mRawVolume;
+	Texture* mRawMask;
+	bool mRawVolumeNew;
+	bool mRawMaskNew;
+	bool mVolumeColored;
+	
+	struct FrameData {
+		// Volume color and density, post-transfer and post-threshold
+		Texture* mBakedVolume;
+		bool mImagesNew;
+		bool mDirty;
+	};
+	FrameData* mFrameData;
+
 	Camera* mMainCamera;
 
-	float3 mPlayerVelocity;
-	bool mFlying;
-
 	MouseKeyboardInput* mInput;
+
+	float mZoom;
 
 	bool mShowPerformance;
 	bool mSnapshotPerformance;
@@ -33,250 +68,87 @@ private:
 	float mFps;
 	uint32_t mFrameCount;
 
+	std::unordered_map<std::string, bool> mDataFolders;
+
+	inline void MarkCopyDirty() {
+		mFrameIndex = 0;
+		for (uint32_t i = 0; i < mScene->Instance()->Device()->MaxFramesInFlight(); i++)
+			mFrameData[i].mDirty = true;
+	}
+
 public:
-	PLUGIN_EXPORT DicomVis(): mScene(nullptr), mSelected(nullptr), mFlying(false), mShowPerformance(false), mSnapshotPerformance(false), mCameraEuler(0), mFrameCount(0), mFrameTimeAccum(0), mFps(0), mPlayerVelocity(0) {
+	PLUGIN_EXPORT DicomVis(): mScene(nullptr), mSelected(nullptr), mShowPerformance(false), mSnapshotPerformance(false),
+		mFrameCount(0), mFrameTimeAccum(0), mFps(0), mFrameIndex(0), mRawVolume(nullptr), mRawMask(nullptr), mRawMaskNew(false), mRawVolumeNew(false), mColorize(false),
+		mPhysicalShading(false),
+		mDensity(500.f), mRemapMin(.125f), mRemapMax(1.f), mCutoff(1.f), mStepSize(.001f), mTransferMin(.01f), mTransferMax(.5f),
+		mVolumeScatter(1.f), mVolumeExtinction(.2f) {
 		mEnabled = true;
 	}
 	PLUGIN_EXPORT ~DicomVis() {
-	for (Object* obj : mObjects)
-		mScene->RemoveObject(obj);
-}
+		safe_delete(mRawVolume);
+		for (uint32_t i = 0; i < mScene->Instance()->Device()->MaxFramesInFlight(); i++) {
+			safe_delete(mFrameData[i].mBakedVolume);
+		}
+		for (Object* obj : mObjects)
+			mScene->RemoveObject(obj);
+	}
 
 	PLUGIN_EXPORT bool Init(Scene* scene) override {
 		mScene = scene;
 		mInput = mScene->InputManager()->GetFirst<MouseKeyboardInput>();
 
-		shared_ptr<Object> player = make_shared<Object>("Player");
-		mScene->AddObject(player);
-		mPlayer = player.get();
-		mObjects.push_back(mPlayer);
+		mZoom = 3.f;
 
 		shared_ptr<Camera> camera = make_shared<Camera>("Camera", mScene->Instance()->Window());
 		mScene->AddObject(camera);
 		camera->Near(.01f);
 		camera->Far(800.f);
 		camera->FieldOfView(radians(65.f));
-		camera->LocalPosition(0, 1.6f, 0);
+		camera->LocalPosition(0, 1.6f, -mZoom);
 		mMainCamera = camera.get();
-		mPlayer->AddChild(mMainCamera);
 		mObjects.push_back(mMainCamera);
-
-		#pragma region load glTF
-		shared_ptr<Material> opaque = make_shared<Material>("PBR", mScene->AssetManager()->LoadShader("Shaders/pbr.stm"));
-		opaque->EnableKeyword("TEXTURED");
-		opaque->SetParameter("TextureST", float4(1, 1, 0, 0));
-
-		shared_ptr<Material> alphaClip = make_shared<Material>("Cutout PBR", mScene->AssetManager()->LoadShader("Shaders/pbr.stm"));
-		alphaClip->RenderQueue(5000);
-		alphaClip->BlendMode(BLEND_MODE_ALPHA);
-		alphaClip->CullMode(VK_CULL_MODE_NONE);
-		alphaClip->EnableKeyword("TEXTURED");
-		alphaClip->EnableKeyword("ALPHA_CLIP");
-		alphaClip->EnableKeyword("TWO_SIDED");
-		alphaClip->SetParameter("TextureST", float4(1, 1, 0, 0));
-
-		shared_ptr<Material> alphaBlend = make_shared<Material>("Transparent PBR", mScene->AssetManager()->LoadShader("Shaders/pbr.stm"));
-		alphaBlend->RenderQueue(5000);
-		alphaBlend->BlendMode(BLEND_MODE_ALPHA);
-		alphaBlend->CullMode(VK_CULL_MODE_NONE);
-		alphaBlend->EnableKeyword("TEXTURED");
-		alphaBlend->EnableKeyword("TWO_SIDED");
-		alphaBlend->SetParameter("TextureST", float4(1, 1, 0, 0));
-
-		shared_ptr<Material> curOpaque = nullptr;
-		shared_ptr<Material> curClip = nullptr;
-		shared_ptr<Material> curBlend = nullptr;
-
-		uint32_t arraySize =
-			mScene->AssetManager()->LoadShader("Shaders/pbr.stm")->GetGraphics(PASS_MAIN, { "TEXTURED" })->mDescriptorBindings.at("MainTextures").second.descriptorCount;
-
-		uint32_t opaque_i = 0;
-		uint32_t clip_i = 0;
-		uint32_t blend_i = 0;
-
-		string folder = "Assets/Models/room/";
-		string file = "CrohnsProtoRoom.gltf";
-
-		auto matfunc = [&](Scene* scene, aiMaterial* aimaterial) {
-			aiString alphaMode;
-			if (aimaterial->Get(AI_MATKEY_GLTF_ALPHAMODE, alphaMode) == AI_SUCCESS) {
-				if (alphaMode == aiString("MASK")) return alphaClip;
-				if (alphaMode == aiString("BLEND")) return alphaBlend;
-			}
-			return opaque;
-		};
-		auto objfunc = [&](Scene* scene, Object* object, aiMaterial* aimaterial) {
-			MeshRenderer* renderer = dynamic_cast<MeshRenderer*>(object);
-			if (!renderer) return;
-
-			Material* mat = renderer->Material();
-			uint32_t i;
-
-			if (mat == opaque.get()) {
-				i = opaque_i;
-				opaque_i++;
-				if (opaque_i >= arraySize) curOpaque.reset();
-				if (!curOpaque) {
-					opaque_i = opaque_i % arraySize;
-					curOpaque = make_shared<Material>("PBR", mScene->AssetManager()->LoadShader("Shaders/pbr.stm"));
-					curOpaque->EnableKeyword("TEXTURED");
-					curOpaque->SetParameter("TextureST", float4(1, 1, 0, 0));
-				}
-				renderer->Material(curOpaque);
-				mat = curOpaque.get();
-
-			}
-			else if (mat == alphaClip.get()) {
-				i = clip_i;
-				clip_i++;
-				if (clip_i >= arraySize) curClip.reset();
-				if (!curClip) {
-					clip_i = clip_i % arraySize;
-					curClip = make_shared<Material>("Cutout PBR", mScene->AssetManager()->LoadShader("Shaders/pbr.stm"));
-					curClip->RenderQueue(5000);
-					curClip->BlendMode(BLEND_MODE_ALPHA);
-					curClip->CullMode(VK_CULL_MODE_NONE);
-					curClip->EnableKeyword("TEXTURED");
-					curClip->EnableKeyword("ALPHA_CLIP");
-					curClip->EnableKeyword("TWO_SIDED");
-					curClip->SetParameter("TextureST", float4(1, 1, 0, 0));
-				}
-				renderer->Material(curClip);
-				mat = curClip.get();
-
-			}
-			else if (mat == alphaBlend.get()) {
-				i = blend_i;
-				blend_i++;
-				if (blend_i >= 64) curBlend.reset();
-				if (!curBlend) {
-					blend_i = blend_i % arraySize;
-					curBlend = make_shared<Material>("Transparent PBR", mScene->AssetManager()->LoadShader("Shaders/pbr.stm"));
-					curBlend->RenderQueue(5000);
-					curBlend->BlendMode(BLEND_MODE_ALPHA);
-					curBlend->CullMode(VK_CULL_MODE_NONE);
-					curBlend->EnableKeyword("TEXTURED");
-					curBlend->EnableKeyword("TWO_SIDED");
-					curBlend->SetParameter("TextureST", float4(1, 1, 0, 0));
-				}
-				renderer->Material(curBlend);
-				mat = curBlend.get();
-
-			}
-			else return;
-
-			aiColor3D emissiveColor(0);
-			aiColor4D baseColor(1);
-			float metallic = 1.f;
-			float roughness = 1.f;
-			aiString baseColorTexture, metalRoughTexture, normalTexture, emissiveTexture;
-
-			if (aimaterial->GetTexture(AI_MATKEY_GLTF_PBRMETALLICROUGHNESS_BASE_COLOR_TEXTURE, &baseColorTexture) == AI_SUCCESS && baseColorTexture.length) {
-				mat->SetParameter("MainTextures", i, scene->AssetManager()->LoadTexture(folder + baseColorTexture.C_Str()));
-				baseColor = aiColor4D(1);
-			}
-			else
-				mat->SetParameter("MainTextures", i, scene->AssetManager()->LoadTexture("Assets/Textures/white.png"));
-
-			if (aimaterial->GetTexture(AI_MATKEY_GLTF_PBRMETALLICROUGHNESS_METALLICROUGHNESS_TEXTURE, &metalRoughTexture) == AI_SUCCESS && metalRoughTexture.length)
-				mat->SetParameter("MaskTextures", i, scene->AssetManager()->LoadTexture(folder + metalRoughTexture.C_Str(), false));
-			else
-				mat->SetParameter("MaskTextures", i, scene->AssetManager()->LoadTexture("Assets/Textures/mask.png", false));
-
-			if (aimaterial->GetTexture(aiTextureType_NORMALS, 0, &normalTexture) == AI_SUCCESS && normalTexture.length)
-				mat->SetParameter("NormalTextures", i, scene->AssetManager()->LoadTexture(folder + normalTexture.C_Str(), false));
-			else
-				mat->SetParameter("NormalTextures", i, scene->AssetManager()->LoadTexture("Assets/Textures/bump.png", false));
-
-			aimaterial->Get(AI_MATKEY_GLTF_PBRMETALLICROUGHNESS_BASE_COLOR_FACTOR, baseColor);
-			aimaterial->Get(AI_MATKEY_GLTF_PBRMETALLICROUGHNESS_METALLIC_FACTOR, metallic);
-			aimaterial->Get(AI_MATKEY_GLTF_PBRMETALLICROUGHNESS_ROUGHNESS_FACTOR, roughness);
-			aimaterial->Get(AI_MATKEY_COLOR_EMISSIVE, emissiveColor);
-
-			renderer->PushConstant("TextureIndex", i);
-			renderer->PushConstant("Color", float4(baseColor.r, baseColor.g, baseColor.b, baseColor.a));
-			renderer->PushConstant("Roughness", roughness);
-			renderer->PushConstant("Metallic", metallic);
-			renderer->PushConstant("Emission", float3(emissiveColor.r, emissiveColor.g, emissiveColor.b));
-		};
-
-		queue<Object*> nodes;
-		nodes.push(mScene->LoadModelScene(folder + file, matfunc, objfunc, .6f, 1.f, .05f, .0015f));
-		while (nodes.size()) {
-			Object* o = nodes.front();
-			nodes.pop();
-			mObjects.push_back(o);
-			for (uint32_t i = 0; i < o->ChildCount(); i++)
-				nodes.push(o->Child(i));
-
-			if (Light* l = dynamic_cast<Light*>(o))
-				l->CascadeCount(1);
-		}
-		#pragma endregion
 
 		mScene->Environment()->EnableCelestials(false);
 		mScene->Environment()->EnableScattering(false);
-		mScene->Environment()->AmbientLight(.2f);
-		mScene->Environment()->EnvironmentTexture(mScene->AssetManager()->LoadTexture("Assets/Textures/ocean hdri.jpg"));
+		mScene->Environment()->EnvironmentTexture(mScene->AssetManager()->LoadTexture("Assets/Textures/paul_lobe_haus_8k.hdr"));
+		mScene->Environment()->AmbientLight(.1f);
+
+		string path = "/Data";
+		for (uint32_t i = 0; i < mScene->Instance()->CommandLineArguments().size(); i++)
+			if (mScene->Instance()->CommandLineArguments()[i] == "--datapath") {
+				i++;
+				if (i < mScene->Instance()->CommandLineArguments().size())
+					path = mScene->Instance()->CommandLineArguments()[i];
+			}
+		if (!fs::exists(path)) path = "/Data";
+		if (!fs::exists(path)) path = "/data";
+		if (!fs::exists(path)) path = "~/Data";
+		if (!fs::exists(path)) path = "~/data";
+		if (!fs::exists(path)) path = "C:/Data";
+		if (!fs::exists(path)) path = "D:/Data";
+		if (!fs::exists(path)) path = "E:/Data";
+		if (!fs::exists(path)) path = "F:/Data";
+		if (!fs::exists(path)) path = "G:/Data";
+
+		if (!fs::exists(path)){
+			fprintf_color(COLOR_RED, stderr, "DicomVis: Could not locate datapath. Please specify with --datapath <path>\n");
+			throw;
+		}
+
+		for (const auto& p : fs::recursive_directory_iterator(path))
+			if (p.path().extension().string() == ".dcm")
+				mDataFolders[p.path().parent_path().string()] = false;
+			else if (p.path().extension().string() == ".raw")
+				mDataFolders[p.path().parent_path().string()] = true;
+
+		mFrameData = new FrameData[mScene->Instance()->Device()->MaxFramesInFlight()];
+		memset(mFrameData, 0, sizeof(FrameData) * mScene->Instance()->Device()->MaxFramesInFlight());
 
 		return true;
 	}
 	PLUGIN_EXPORT void Update() override {
-		#pragma region player movement
-		#pragma region rotate camera
-		if (mInput->LockMouse()) {
-			float3 md = float3(mInput->CursorDelta(), 0);
-			md = float3(md.y, md.x, 0) * .003f;
-			mCameraEuler += md;
-			mCameraEuler.x = clamp(mCameraEuler.x, -PI * .5f, PI * .5f);
-			mMainCamera->LocalRotation(quaternion(float3(mCameraEuler.x, 0, 0)));
-			mPlayer->LocalRotation(quaternion(float3(0, mCameraEuler.y, 0)));
-		}
-		#pragma endregion
-
-		#pragma region apply movement force
-		float3 move = 0;
-		if (mInput->KeyDown(KEY_W)) move.z += 1;
-		if (mInput->KeyDown(KEY_S)) move.z -= 1;
-		if (mInput->KeyDown(KEY_D)) move.x += 1;
-		if (mInput->KeyDown(KEY_A)) move.x -= 1;
-		move = (mFlying ? mMainCamera->WorldRotation() : mPlayer->WorldRotation()) * move;
-		if (dot(move, move) > .001f) {
-			move = normalize(move);
-			move *= 2.5f;
-			if (mInput->KeyDown(KEY_LSHIFT))
-				move *= 2.5f;
-		}
-		float3 mf = 5 * (move - mPlayerVelocity) * mScene->Instance()->DeltaTime();
-		if (!mFlying) mf.y = 0;
-		mPlayerVelocity += mf;
-		#pragma endregion
-
-		if (!mFlying) mPlayerVelocity.y -= 9.8f * mScene->Instance()->DeltaTime(); // gravity
-
-		float3 p = mPlayer->WorldPosition();
-		p += mPlayerVelocity * mScene->Instance()->DeltaTime(); // integrate velocity
-
-		if (p.y < .5f) {
-			p.y = .5f;
-			mPlayerVelocity.y = 0;
-
-			if (!mFlying && mInput->KeyDown(KEY_SPACE))
-				mPlayerVelocity.y += 4.f;
-
-		}
-		mPlayer->LocalPosition(p);
-		#pragma endregion
-
-		if (mInput->KeyDownFirst(MOUSE_RIGHT))
-			mInput->LockMouse(!mInput->LockMouse());
-
 		if (mInput->KeyDownFirst(KEY_F1))
 			mScene->DrawGizmos(!mScene->DrawGizmos());
-		if (mInput->KeyDownFirst(KEY_F2))
-			mFlying = !mFlying;
-
-
 		if (mInput->KeyDownFirst(KEY_TILDE))
 			mShowPerformance = !mShowPerformance;
 
@@ -308,6 +180,22 @@ public:
 			}
 		}
 
+		if (mInput->GetPointer(0)->mLastGuiHitT < 0) {
+			if (mInput->ScrollDelta() != 0){
+				mZoom = clamp(mZoom - mInput->ScrollDelta() * .05f, -1.f, 5.f);
+				mMainCamera->LocalPosition(0, 1.6f, -mZoom);
+
+				mFrameIndex = 0;
+			}
+			if (mInput->KeyDown(MOUSE_LEFT)) {
+				float3 axis = mMainCamera->WorldRotation() * float3(0, 1, 0) * mInput->CursorDelta().x + mMainCamera->WorldRotation() * float3(1, 0, 0) * mInput->CursorDelta().y;
+				if (dot(axis, axis) > .001f){
+					mVolumeRotation = quaternion(length(axis) * .003f, -normalize(axis)) * mVolumeRotation;
+					mFrameIndex = 0;
+				}
+			}
+		}
+
 		// count fps
 		mFrameTimeAccum += mScene->Instance()->DeltaTime();
 		mFrameCount++;
@@ -318,21 +206,27 @@ public:
 		}
 	}
 
-	PLUGIN_EXPORT void PostRenderScene(CommandBuffer* commandBuffer, Camera* camera, PassType pass) override {
+	PLUGIN_EXPORT void PreRender(CommandBuffer* commandBuffer, Camera* camera, PassType pass) override {
 		if (pass != PASS_MAIN || camera != mScene->Cameras()[0]) return;
+
+		Font* reg14 = mScene->AssetManager()->LoadFont("Assets/Fonts/OpenSans-Regular.ttf", 14);
+		Font* sem11 = mScene->AssetManager()->LoadFont("Assets/Fonts/OpenSans-SemiBold.ttf", 11);
+		Font* sem16 = mScene->AssetManager()->LoadFont("Assets/Fonts/OpenSans-SemiBold.ttf", 16);
+		Font* bld24 = mScene->AssetManager()->LoadFont("Assets/Fonts/OpenSans-Bold.ttf", 24);
+
+		float2 s(camera->FramebufferWidth(), camera->FramebufferHeight());
+		float2 c = mInput->CursorPos();
+		c.y = s.y - c.y;
+		
 		if (mShowPerformance) {
 			char tmpText[64];
-
-			Font* sem11 = mScene->AssetManager()->LoadFont("Assets/Fonts/OpenSans-SemiBold.ttf", 11);
-			Font* sem16 = mScene->AssetManager()->LoadFont("Assets/Fonts/OpenSans-SemiBold.ttf", 16);
-			Font* reg14 = mScene->AssetManager()->LoadFont("Assets/Fonts/OpenSans-Regular.ttf", 14);
-
-			float2 s(camera->FramebufferWidth(), camera->FramebufferHeight());
-
-			float graphHeight = 100;
+			snprintf(tmpText, 64, "%.2f fps\n", mFps);
+			GUI::DrawString(sem16, tmpText, 1.f, float2(5, camera->FramebufferHeight() - 18), 18.f, TEXT_ANCHOR_MIN, TEXT_ANCHOR_MAX);
 
 			#ifdef PROFILER_ENABLE
 			const uint32_t pointCount = PROFILER_FRAME_COUNT - 1;
+			
+			float graphHeight = 100;
 
 			float2 points[pointCount];
 			float m = 0;
@@ -345,28 +239,25 @@ public:
 			for (uint32_t i = 0; i < pointCount; i++)
 				points[i].y /= m;
 
-			DrawScreenRect(commandBuffer, camera, float2(0, 0), float2(s.x, graphHeight), float4(.1f, .1f, .1f, 1));
-			DrawScreenRect(commandBuffer, camera, float2(0, graphHeight - 1), float2(s.x, 2), float4(.2f, .2f, .2f, 1));
+			GUI::Rect(fRect2D(0, 0, s.x, graphHeight), float4(.1f, .1f, .1f, 1));
+			GUI::Rect(fRect2D(0, graphHeight - 1, s.x, 2), float4(.2f, .2f, .2f, 1));
 
 			snprintf(tmpText, 64, "%.1fms", m);
-			sem11->DrawScreenString(commandBuffer, camera, tmpText, float4(.6f, .6f, .6f, 1.f), float2(2, graphHeight - 10), 11.f);
+			GUI::DrawString(sem11, tmpText, float4(.6f, .6f, .6f, 1.f), float2(2, graphHeight - 10), 11.f);
 
 			for (float i = 1; i < 3; i++) {
 				float x = m * i / 3.f;
 				snprintf(tmpText, 32, "%.1fms", x);
-				DrawScreenRect(commandBuffer, camera, float2(0, graphHeight * (i / 3.f) - 1), float2(s.x, 1), float4(.2f, .2f, .2f, 1));
-				sem11->DrawScreenString(commandBuffer, camera, tmpText, float4(.6f, .6f, .6f, 1.f), float2(2, graphHeight * (i / 3.f) + 2), 11.f);
+				GUI::Rect(fRect2D(0, graphHeight * (i / 3.f) - 1, s.x, 1), float4(.2f, .2f, .2f, 1));
+				GUI::DrawString(sem11, tmpText, float4(.6f, .6f, .6f, 1.f), float2(2, graphHeight * (i / 3.f) + 2), 11.f);
 			}
 
-			DrawScreenLine(commandBuffer, camera, points, pointCount, 0, float2(s.x, graphHeight), float4(.2f, 1.f, .2f, 1.f));
+			GUI::DrawScreenLine(points, pointCount, 1.5f, 0, float2(s.x, graphHeight), float4(.2f, 1.f, .2f, 1.f));
 
 			if (mSnapshotPerformance) {
-				float2 c = mInput->CursorPos();
-				c.y = s.y - c.y;
-
 				if (c.y < 100) {
 					uint32_t hvr = (uint32_t)((c.x / s.x) * (PROFILER_FRAME_COUNT - 2) + .5f);
-					DrawScreenRect(commandBuffer, camera, float2(s.x * hvr / (PROFILER_FRAME_COUNT - 2), 0), float2(1, graphHeight), float4(1, 1, 1, .15f));
+					GUI::Rect(fRect2D(s.x * hvr / (PROFILER_FRAME_COUNT - 2), 0, 1, graphHeight), float4(1, 1, 1, .15f));
 					if (mInput->KeyDown(MOUSE_LEFT))
 						mSelectedFrame = hvr;
 				}
@@ -376,7 +267,7 @@ public:
 					float sampleHeight = 20;
 
 					// selection line
-					DrawScreenRect(commandBuffer, camera, float2(s.x * mSelectedFrame / (PROFILER_FRAME_COUNT - 2), 0), float2(1, graphHeight), 1);
+					GUI::Rect(fRect2D(s.x * mSelectedFrame / (PROFILER_FRAME_COUNT - 2), 0, 1, graphHeight), 1);
 
 					float id = 1.f / (float)mProfilerFrames[mSelectedFrame].mDuration.count();
 
@@ -390,13 +281,13 @@ public:
 						float2 size(s.x * (float)p.first->mDuration.count() * id, sampleHeight);
 						float4 col(0, 0, 0, 1);
 
-						if (c.x > pos.x&& c.y > pos.y&& c.x < pos.x + size.x && c.y < pos.y + size.y) {
+						if (c.x > pos.x&& c.y > pos.y && c.x < pos.x + size.x && c.y < pos.y + size.y) {
 							selected = p.first;
 							col.rgb = 1;
 						}
 
-						DrawScreenRect(commandBuffer, camera, pos, size, col);
-						DrawScreenRect(commandBuffer, camera, pos + 1, size - 2, float4(.3f, .9f, .3f, 1));
+						GUI::Rect(fRect2D(pos, size), col);
+						GUI::Rect(fRect2D(pos + 1, size - 2), float4(.3f, .9f, .3f, 1));
 
 						for (auto it = p.first->mChildren.begin(); it != p.first->mChildren.end(); it++)
 							samples.push(make_pair(&*it, p.second + 1));
@@ -404,27 +295,320 @@ public:
 
 					if (selected) {
 						snprintf(tmpText, 64, "%s: %.2fms\n", selected->mLabel, selected->mDuration.count() * 1e-6f);
-						DrawScreenRect(commandBuffer, camera, float2(0, graphHeight), float2(s.x, 20), float4(0, 0, 0, .8f));
-						reg14->DrawScreenString(commandBuffer, camera, tmpText, 1, float2(s.x * .5f, graphHeight + 8), 14.f, TEXT_ANCHOR_MID, TEXT_ANCHOR_MID);
+						GUI::Rect(fRect2D(0, graphHeight, s.x, 20), float4(0,0,0,.8f));
+						GUI::DrawString(reg14, tmpText, 1, float2(s.x * .5f, graphHeight + 8), 14.f, TEXT_ANCHOR_MID, TEXT_ANCHOR_MID);
 					}
 				}
 
 			}
 			#endif
-
-			snprintf(tmpText, 64, "%.2f fps | %llu tris\n", mFps, commandBuffer->mTriangleCount);
-			sem16->DrawScreenString(commandBuffer, camera, tmpText, 1.f, float2(5, camera->FramebufferHeight() - 18), 18.f);
 		}
+
+		GUI::BeginScreenLayout(LAYOUT_VERTICAL, fRect2D(10, s.y * .5f - 400, 300, 800), float4(.3f, .3f, .3f, 1), 10);
+
+		GUI::LayoutLabel(bld24, "Load Data Set", 24, 30, 0, 1);
+		GUI::LayoutSeparator(.5f, 1);
+
+		GUI::BeginScrollSubLayout(175, mDataFolders.size() * 24, float4(.2f, .2f, .2f, 1), 5);
+		for (const auto& p : mDataFolders)
+			if (GUI::LayoutButton(sem16, fs::path(p.first).stem().string(), 16, 24, p.second ? float4(.4f, .4f, .15f, 1) : float4(.2f, .2f, .2f, 1), 1, 2, TEXT_ANCHOR_MID))
+				LoadVolume(commandBuffer, p.first, p.second);
+		GUI::EndLayout();
+
+
+		if (GUI::LayoutButton(sem16, "Invert", 16, 24, mInvert ? float4(.5f, .5f, .5f, 1) : float4(.25f, .25f, .25f, 1), 1)) {
+			mInvert = !mInvert;
+			MarkCopyDirty();
+		}
+		if (GUI::LayoutButton(sem16, "Colorize", 16, 24, mColorize ? float4(.5f, .5f, .5f, 1) : float4(.25f, .25f, .25f, 1), 1)) {
+			mColorize = !mColorize;
+			MarkCopyDirty();
+		}
+		if (GUI::LayoutButton(sem16, "Physical Shading", 16, 24, mPhysicalShading ? float4(.5f, .5f, .5f, 1) : float4(.25f, .25f, .25f, 1), 1)) {
+			mPhysicalShading = !mPhysicalShading;
+			mFrameIndex = 0;
+		}
+		GUI::LayoutSeparator(.5f, 1, 3);
+
+		GUI::LayoutLabel(bld24, "Render Settings", 18, 24, 0, 1);
+		GUI::LayoutSpace(8);
+
+		GUI::LayoutLabel(sem16, "Step Size: " + to_string(mStepSize), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+		if (GUI::LayoutSlider(mStepSize, .0005f, .01f, 16, float4(.5f, .5f, .5f, 1), 4));
+		GUI::LayoutLabel(sem16, "Density: " + to_string(mDensity), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+		if (GUI::LayoutSlider(mDensity, 100, 10000.f, 16, float4(.5f, .5f, .5f, 1), 4)) mFrameIndex = 0;
+		GUI::LayoutSpace(10);
+
+		GUI::LayoutLabel(sem16, "Remap Min: " + to_string(mRemapMin), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+		if (GUI::LayoutSlider(mRemapMin, 0, 1, 16, float4(.5f, .5f, .5f, 1), 4)) MarkCopyDirty();
+		GUI::LayoutLabel(sem16, "Remap Max: " + to_string(mRemapMax), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+		if (GUI::LayoutSlider(mRemapMax, 0, 1, 16, float4(.5f, .5f, .5f, 1), 4)) MarkCopyDirty();
+		GUI::LayoutLabel(sem16, "Cutoff: " + to_string(mCutoff), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+		if (GUI::LayoutSlider(mCutoff, 0, 1, 16, float4(.5f, .5f, .5f, 1), 4)) MarkCopyDirty();
+
+		if (mColorize) {
+			GUI::LayoutSpace(10);
+
+			GUI::LayoutLabel(sem16, "Transfer Min: " + to_string(mTransferMin), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+			if (GUI::LayoutSlider(mTransferMin, 0, 1, 16, float4(.5f, .5f, .5f, 1), 4)) MarkCopyDirty();
+			GUI::LayoutLabel(sem16, "Transfer Max: " + to_string(mTransferMax), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+			if (GUI::LayoutSlider(mTransferMax, 0, 1, 16, float4(.5f, .5f, .5f, 1), 4)) MarkCopyDirty();
+		}
+		if (mPhysicalShading) {
+			GUI::LayoutSpace(10);
+
+			GUI::LayoutLabel(sem16, "Scattering: " + to_string(mVolumeScatter), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+			if (GUI::LayoutSlider(mVolumeScatter, 0, 3, 16, float4(.5f, .5f, .5f, 1), 4)) mFrameIndex = 0;
+			GUI::LayoutLabel(sem16, "Extinction: " + to_string(mVolumeExtinction), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+			if (GUI::LayoutSlider(mVolumeExtinction, 0, .5f, 16, float4(.5f, .5f, .5f, 1), 4)) mFrameIndex = 0;
+			GUI::LayoutLabel(sem16, "HG Phase: " + to_string(mVolumePhaseHG), 16, 16, 0, 1, 0, TEXT_ANCHOR_MIN);
+			if (GUI::LayoutSlider(mVolumePhaseHG, -1, 1, 16, float4(.5f, .5f, .5f, 1), 4)) mFrameIndex = 0;
+		}
+
+		GUI::EndLayout();
 	}
-	PLUGIN_EXPORT void DrawGizmos(CommandBuffer* commandBuffer, Camera* camera) override {
-		float2 s(camera->FramebufferWidth(), camera->FramebufferHeight());
-		float2 c = mInput->CursorPos();
-		Ray ray = camera->ScreenToWorldRay(c / s);
-		float t;
-		PROFILER_BEGIN("Raycast");
-		if (mScene->Raycast(ray, &t))
-			Gizmos::DrawWireSphere(ray.mOrigin + ray.mDirection * t, .02f, 1);
-		PROFILER_END;
+
+	PLUGIN_EXPORT void PostProcess(CommandBuffer* commandBuffer, Camera* camera) override {
+		if (!mRawVolume) return;
+		
+		FrameData& fd = mFrameData[commandBuffer->Device()->FrameContextIndex()];
+		FrameData& pfd = mFrameData[(commandBuffer->Device()->FrameContextIndex() + commandBuffer->Device()->MaxFramesInFlight()-1) % commandBuffer->Device()->MaxFramesInFlight()];
+
+		if (mRawVolumeNew) {
+			mRawVolume->TransitionImageLayout(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, commandBuffer);
+			mRawVolumeNew = false;
+		}
+		if (mRawMaskNew) {
+			mRawMask->TransitionImageLayout(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, commandBuffer);
+			mRawMaskNew = false;
+		}
+		if (fd.mImagesNew) {
+			fd.mBakedVolume->TransitionImageLayout(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, commandBuffer);
+			fd.mImagesNew = false;
+		}
+		
+		float2 res(camera->FramebufferWidth(), camera->FramebufferHeight());
+		float4x4 ivp[2];
+		ivp[0] = camera->InverseViewProjection(EYE_LEFT);
+		ivp[1] = camera->InverseViewProjection(EYE_RIGHT);
+		float3 cp[2];
+		cp[0] = camera->InverseView(EYE_LEFT)[3].xyz;
+		cp[1] = camera->InverseView(EYE_RIGHT)[3].xyz;
+		float4 ivr = inverse(mVolumeRotation).xyzw;
+		float3 ivs = 1.f / mVolumeScale;
+		float near = camera->Near();
+		float far = camera->Far();
+		
+		float remapRange = 1.f / (mRemapMax - mRemapMin);
+
+		float3 lightCol = 2;
+		float3 lightDir = normalize(float3(.1f, .5f, -1));
+
+		if (fd.mDirty) {
+			// Copy volume
+			set<string> kw;
+			if (mRawMask) kw.emplace("READ_MASK");
+			if (mInvert) kw.emplace("INVERT");
+			if (mVolumeColored) kw.emplace("COLORED");
+			else if (mColorize) kw.emplace("COLORIZE");
+			ComputeShader* copy = mScene->AssetManager()->LoadShader("Shaders/precompute.stm")->GetCompute("CopyRaw", kw);
+			vkCmdBindPipeline(*commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, copy->mPipeline);
+			
+			DescriptorSet* ds = commandBuffer->Device()->GetTempDescriptorSet("CopyRaw", copy->mDescriptorSetLayouts[0]);
+			ds->CreateStorageTextureDescriptor(mRawVolume, copy->mDescriptorBindings.at("RawVolume").second.binding, VK_IMAGE_LAYOUT_GENERAL);
+			if (mRawMask) ds->CreateStorageTextureDescriptor(mRawMask, copy->mDescriptorBindings.at("RawMask").second.binding, VK_IMAGE_LAYOUT_GENERAL);
+			ds->CreateStorageTextureDescriptor(fd.mBakedVolume, copy->mDescriptorBindings.at("BakedVolume").second.binding, VK_IMAGE_LAYOUT_GENERAL);
+			ds->FlushWrites();
+			vkCmdBindDescriptorSets(*commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, copy->mPipelineLayout, 0, 1, *ds, 0, nullptr);
+
+			commandBuffer->PushConstant(copy, "RemapMin", &mRemapMin);
+			commandBuffer->PushConstant(copy, "InvRemapRange", &remapRange);
+			commandBuffer->PushConstant(copy, "Cutoff", &mCutoff);
+			commandBuffer->PushConstant(copy, "TransferMin", &mTransferMin);
+			commandBuffer->PushConstant(copy, "TransferMax", &mTransferMax);
+
+			vkCmdDispatch(*commandBuffer, (mRawVolume->Width() + 3) / 4, (mRawVolume->Height() + 3) / 4, (mRawVolume->Depth() + 3) / 4);
+
+			fd.mBakedVolume->TransitionImageLayout(VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, commandBuffer);
+			fd.mBakedVolume->GenerateMipMaps(commandBuffer);
+
+			fd.mDirty = false;
+		}
+
+		fd.mBakedVolume->TransitionImageLayout(VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, commandBuffer);
+		
+		#pragma region render volume
+		{
+			float3 vres(fd.mBakedVolume->Width(), fd.mBakedVolume->Height(), fd.mBakedVolume->Depth());
+			set<string> kw;
+			if (mPhysicalShading) kw.emplace("PHYSICAL_SHADING");
+			if (mColorize) kw.emplace("COLORIZE");
+			ComputeShader* draw = mScene->AssetManager()->LoadShader("Shaders/volume.stm")->GetCompute("Draw", kw);
+			vkCmdBindPipeline(*commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, draw->mPipeline);
+			
+			DescriptorSet* ds = commandBuffer->Device()->GetTempDescriptorSet("Draw Volume", draw->mDescriptorSetLayouts[0]);
+			ds->CreateSampledTextureDescriptor(fd.mBakedVolume, draw->mDescriptorBindings.at("BakedVolume").second.binding, VK_IMAGE_LAYOUT_GENERAL);
+			if (mPhysicalShading){
+				//ds->CreateSampledTextureDescriptor(fd.mBakedInscatter, draw->mDescriptorBindings.at("BakedInscatter").second.binding, VK_IMAGE_LAYOUT_GENERAL);
+				ds->CreateSampledTextureDescriptor(mScene->Environment()->EnvironmentTexture(), draw->mDescriptorBindings.at("EnvironmentTexture").second.binding);
+			}
+			ds->CreateStorageTextureDescriptor(camera->ResolveBuffer(0), draw->mDescriptorBindings.at("RenderTarget").second.binding, VK_IMAGE_LAYOUT_GENERAL);
+			ds->CreateStorageTextureDescriptor(camera->ResolveBuffer(1), draw->mDescriptorBindings.at("DepthNormal").second.binding, VK_IMAGE_LAYOUT_GENERAL);
+			ds->CreateSampledTextureDescriptor(mScene->AssetManager()->LoadTexture("Assets/Textures/rgbanoise.png", false), draw->mDescriptorBindings.at("NoiseTex").second.binding);
+			ds->FlushWrites();
+			vkCmdBindDescriptorSets(*commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, draw->mPipelineLayout, 0, 1, *ds, 0, nullptr);
+
+			uint2 wo(0);
+			float3 vp = mVolumePosition - camera->WorldPosition();
+			float3 ambient = mScene->Environment()->AmbientLight();
+
+			commandBuffer->PushConstant(draw, "VolumePosition", &vp);
+			commandBuffer->PushConstant(draw, "VolumeRotation", &mVolumeRotation.xyzw);
+			commandBuffer->PushConstant(draw, "VolumeScale", &mVolumeScale);
+			commandBuffer->PushConstant(draw, "InvVolumeRotation", &ivr);
+			commandBuffer->PushConstant(draw, "InvVolumeScale", &ivs);
+			commandBuffer->PushConstant(draw, "VolumeResolution", &vres);
+
+			commandBuffer->PushConstant(draw, "AmbientLight", &ambient);
+			commandBuffer->PushConstant(draw, "Density", &mDensity);
+			commandBuffer->PushConstant(draw, "Extinction", &mVolumeExtinction);
+			commandBuffer->PushConstant(draw, "Scattering", &mVolumeScatter);
+			commandBuffer->PushConstant(draw, "HG", &mVolumePhaseHG);
+
+			commandBuffer->PushConstant(draw, "StepSize", &mStepSize);
+			commandBuffer->PushConstant(draw, "FrameIndex", &mFrameIndex);
+
+			switch (camera->StereoMode()) {
+			case STEREO_NONE:
+				commandBuffer->PushConstant(draw, "InvViewProj", &ivp[0]);
+				commandBuffer->PushConstant(draw, "CameraPosition", &cp[0]);
+				commandBuffer->PushConstant(draw, "WriteOffset", &wo);
+				commandBuffer->PushConstant(draw, "ScreenResolution", &res);
+				vkCmdDispatch(*commandBuffer, (camera->FramebufferWidth() + 7) / 8, (camera->FramebufferHeight() + 7) / 8, 1);
+				break;
+			case STEREO_SBS_HORIZONTAL:
+				res.x *= .5f;
+				commandBuffer->PushConstant(draw, "InvViewProj", &ivp[0]);
+				commandBuffer->PushConstant(draw, "CameraPosition", &cp[0]);
+				commandBuffer->PushConstant(draw, "WriteOffset", &wo);
+				commandBuffer->PushConstant(draw, "ScreenResolution", &res);
+				vkCmdDispatch(*commandBuffer, (camera->FramebufferWidth() / 2 + 7) / 8, (camera->FramebufferHeight() + 7) / 8, 1);
+				wo.x = camera->FramebufferWidth() / 2;
+				commandBuffer->PushConstant(draw, "InvViewProj", &ivp[1]);
+				commandBuffer->PushConstant(draw, "CameraPosition", &cp[1]);
+				commandBuffer->PushConstant(draw, "WriteOffset", &wo);
+				vkCmdDispatch(*commandBuffer, (camera->FramebufferWidth()/2 + 7) / 8, (camera->FramebufferHeight() + 7) / 8, 1);
+				break;
+			case STEREO_SBS_VERTICAL:
+				res.y *= .5f;
+				commandBuffer->PushConstant(draw, "InvViewProj", &ivp[0]);
+				commandBuffer->PushConstant(draw, "CameraPosition", &cp[0]);
+				commandBuffer->PushConstant(draw, "WriteOffset", &wo);
+				commandBuffer->PushConstant(draw, "ScreenResolution", &res);
+				vkCmdDispatch(*commandBuffer, (camera->FramebufferWidth() + 7) / 8, (camera->FramebufferHeight() / 2 + 7) / 8, 1);
+				wo.y = camera->FramebufferWidth() / 2;
+				commandBuffer->PushConstant(draw, "InvViewProj", &ivp[1]);
+				commandBuffer->PushConstant(draw, "CameraPosition", &cp[1]);
+				commandBuffer->PushConstant(draw, "WriteOffset", &wo);
+				vkCmdDispatch(*commandBuffer, (camera->FramebufferWidth() + 7) / 8, (camera->FramebufferHeight() / 2 + 7) / 8, 1);
+				break;
+			}
+
+			camera->ResolveBuffer(0)->TransitionImageLayout(VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, commandBuffer);
+		}
+		#pragma endregion
+
+		mFrameIndex++;
+	}
+	
+	Texture* LoadRawStack(const fs::path& folder, Device* device, float3* scale) {
+		vector<pair<int, string>> images;
+		for (const auto& p : fs::directory_iterator(folder))
+			if (p.path().extension().string() == ".png")
+				images.push_back(make_pair(atoi(p.path().stem().string().c_str()), p.path().string()));
+		if (images.empty()) return nullptr;
+		std::sort(images.begin(), images.end(), [](const pair<int, string>& a, const pair<int, string>& b) {
+			return a.first < b.first;
+		});
+
+		return nullptr;
+	}
+
+	Texture* LoadMask(const fs::path& folder, Device* device) {
+		vector<pair<int, string>> images;
+		for (const auto& p : fs::directory_iterator(folder))
+			if (p.path().extension().string() == ".png")
+				images.push_back(make_pair(atoi(p.path().stem().string().c_str()), p.path().string()));
+		if (images.empty()) return nullptr;
+		std::sort(images.begin(), images.end(), [](const pair<int, string>& a, const pair<int, string>& b) {
+			return a.first < b.first;
+		});
+
+		vector<uint8_t*> pixels(images.size());
+
+		uint32_t width = 0;
+		uint32_t height = 0;
+		uint32_t depth = images.size();
+
+		for (uint32_t i = 0; i < images.size(); i++) {
+			int x,y,c;
+			pixels[i] = stbi_load(images[i].second.c_str(), &x, &y, &c, 1);
+			width  = max(width,  (uint32_t)x);
+			height = max(height, (uint32_t)y);
+		}
+
+		//Texture* mask = new Texture();
+
+		return nullptr;
+	}
+
+	void LoadVolume(CommandBuffer* commandBuffer, const fs::path& folder, bool color) {
+		safe_delete(mRawVolume);
+		safe_delete(mRawMask);
+		for (uint32_t i = 0; i < commandBuffer->Device()->MaxFramesInFlight(); i++) {
+			safe_delete(mFrameData[i].mBakedVolume);
+		}
+
+		Texture* vol;
+		if (color) {
+			vol = LoadRawStack(folder.string(), mScene->Instance()->Device(), &mVolumeScale);
+			if (!vol) {
+				fprintf_color(COLOR_RED, stderr, "Failed to load volume!\n");
+				return;
+			}
+		} else {
+			vol = Dicom::LoadDicomStack(folder.string(), mScene->Instance()->Device(), &mVolumeScale);
+			if (!vol) {
+				fprintf_color(COLOR_RED, stderr, "Failed to load volume!\n");
+				return;
+			}
+
+			string maskPath = folder.string() + "/_mask";
+
+			if (fs::exists(maskPath)) {
+				mRawMask = LoadMask(maskPath, mScene->Instance()->Device());
+				if (!mRawMask)
+					fprintf_color(COLOR_RED, stderr, "Failed to load mask!\n");
+				else
+					mRawMaskNew = true;
+			}
+		}
+
+		mVolumeColored = color;
+		
+		mVolumeRotation = quaternion(0,0,0,1);
+		mVolumePosition = float3(0, 1.6f, 0);
+		mRawVolume = vol;
+		mRawVolumeNew = true;
+
+		for (uint32_t i = 0; i < commandBuffer->Device()->MaxFramesInFlight(); i++) {
+			FrameData& fd = mFrameData[i];
+			fd.mBakedVolume = new Texture("Baked Volume", mScene->Instance()->Device(), nullptr, 0, mRawVolume->Width(), mRawVolume->Height(), mRawVolume->Depth(), VK_FORMAT_R16G16B16A16_UNORM, 3, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+			fd.mImagesNew = true;
+			fd.mDirty = true;
+		}
+
+		mFrameIndex = 0;
 	}
 };
 

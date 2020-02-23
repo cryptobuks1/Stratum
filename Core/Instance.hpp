@@ -17,15 +17,10 @@ namespace x11{
 
 class Window;
 class Device;
+class PluginManager;
 
 class Instance {
 public:
-	struct DisplayCreateInfo {
-		uint32_t mDeviceIndex;
-		VkRect2D mWindowPosition;
-		std::string mXDisplay;
-	};
-
 	ENGINE_EXPORT ~Instance();
 
 	inline ::Device* Device() const { return mDevice; }
@@ -33,19 +28,28 @@ public:
 
 	inline float TotalTime() const { return mTotalTime; }
 	inline float DeltaTime() const { return mDeltaTime; }
+	inline uint64_t FrameCount() const { return mFrameCount; }
 
 	inline uint32_t MaxFramesInFlight() const { return mMaxFramesInFlight; }
 
+	inline const std::vector<std::string>& CommandLineArguments() const { return mCmdArguments; }
+
 	inline operator VkInstance() const { return mInstance; }
+
+	inline void RequestInstanceExtension(const std::string& name) { mInstanceExtensions.emplace(name); }
+	inline void RequestDeviceExtension(const std::string& name) { mDeviceExtensions.emplace(name); }
 
 private:
 	friend class Stratum;
-	ENGINE_EXPORT Instance(const DisplayCreateInfo& display);
+	ENGINE_EXPORT Instance(int argc, char** argv, PluginManager* pluginManager);
 
 	ENGINE_EXPORT bool PollEvents();
 	ENGINE_EXPORT void AdvanceFrame();
 
 	MouseKeyboardInput* mWindowInput;
+
+	std::set<std::string> mInstanceExtensions;
+	std::set<std::string> mDeviceExtensions;
 
 	::Device* mDevice;
 	::Window* mWindow;
@@ -54,11 +58,17 @@ private:
 
 	VkInstance mInstance;
 
+	#ifdef ENABLE_DEBUG_LAYERS
+	VkDebugUtilsMessengerEXT mDebugMessenger;
+	#endif
+
 	std::chrono::high_resolution_clock mClock;
 	std::chrono::high_resolution_clock::time_point mStartTime;
 	std::chrono::high_resolution_clock::time_point mLastFrame;
 	float mTotalTime;
 	float mDeltaTime;
+
+	std::vector<std::string> mCmdArguments;
 
 	bool mDestroyPending;
 	#ifdef __linux

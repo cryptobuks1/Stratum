@@ -5,12 +5,16 @@
 
 class Scene;
 class Camera;
+class Instance;
 
 class EnginePlugin {
 public:
 	bool mEnabled;
 
 	inline virtual ~EnginePlugin() {}
+	
+	inline virtual void PreInstanceInit(Instance* instance) {};
+	inline virtual void PreDeviceInit(Instance* instance, VkPhysicalDevice physicalDevice) {};
 	
 	inline virtual bool Init(Scene* scene) { return true; }
 	

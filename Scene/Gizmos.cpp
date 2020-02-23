@@ -174,12 +174,11 @@ bool Gizmos::RotationHandle(const string& name, const InputPointer* input, const
 }
 
 void Gizmos::DrawLine(const float3& p0, const float3& p1, const float4& color){
-	float3 v1 = float3(0,0,1);
 	float3 v2 = p1 - p0;
 	float l = length(v2);
 	v2 /= l;
 
-	DrawWireCube((p0 + p1) * .5f, float3(0, 0, l * .5f), quaternion(v1, v2), color);
+	DrawWireCube((p0 + p1) * .5f, float3(0, 0, l * .5f), quaternion::FromTo(float3(0,0,1), v2), color);
 }
 void Gizmos::DrawBillboard(const float3& center, const float2& extents, const quaternion& rotation, const float4& color, Texture* texture, const float4& textureST){
 	Gizmo g = {};
@@ -271,7 +270,7 @@ void Gizmos::Draw(CommandBuffer* commandBuffer, PassType pass, Camera* camera) {
 	Buffer* gizmoBuffer = nullptr;
 	DescriptorSet* gizmoDS = nullptr;
 	if (mInstanceBuffers[frameContextIndex].size() <= mBufferIndex[frameContextIndex]) {
-		gizmoBuffer = new Buffer("Gizmos", commandBuffer->Device(), sizeof(Gizmo) * total, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+		gizmoBuffer = new Buffer("Gizmos", commandBuffer->Device(), sizeof(Gizmo) * total, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
 		gizmoBuffer->Map();
 
 		gizmoDS = new DescriptorSet("Gizmos", commandBuffer->Device(), shader->mDescriptorSetLayouts[PER_OBJECT]);
@@ -284,7 +283,7 @@ void Gizmos::Draw(CommandBuffer* commandBuffer, PassType pass, Camera* camera) {
 
 		if (b->Size() < sizeof(Gizmo) * total) {
 			safe_delete(b);
-			b = new Buffer("Gizmos", commandBuffer->Device(), sizeof(Gizmo) * total, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+			b = new Buffer("Gizmos", commandBuffer->Device(), sizeof(Gizmo) * total, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
 			b->Map();
 			gizmoDS->CreateStorageBufferDescriptor(b, 0, b->Size(), INSTANCE_BUFFER_BINDING);
 		}
